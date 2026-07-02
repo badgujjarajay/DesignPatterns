@@ -1,1 +1,335 @@
+# Claude Memory Wrapper — Comprehensive Technical Specification (spec.md)
+
+> **Status:** Draft v1.0
+>
+> **Goal:** Build a transparent wrapper around Claude Code that provides persistent, low-cost, project-aware memory without changing the Claude Code user experience.
+
+---
+
+# 1. Vision
+
+The user should feel like they are using **Claude Code itself**.
+
+There should be:
+
+- No new UI
+- No new login
+- No new permissions
+- No changes to colors, keyboard shortcuts or terminal behavior
+
+The wrapper should simply make Claude "remember".
+
+---
+
+# 2. Design Principles
+
+- Claude Code is a black box. Never modify or fork it.
+- The wrapper surrounds Claude rather than replacing it.
+- Observe everything; interfere with nothing.
+- Store knowledge, not conversations.
+- Prefer one high-quality summarization over hundreds of tiny ones.
+- Keep all storage local.
+- Keep LLM cost extremely low.
+- Everything should be modular.
+
+---
+
+# 3. User Experience
+
+Current workflow:
+
+    $ claude
+
+Proposed workflow:
+
+    $ claude
+
+or
+
+    $ myclaude
+
+The terminal should look identical because the real Claude process is still rendering the UI.
+
+Authentication remains Claude's responsibility.
+
+---
+
+# 4. High-Level Architecture
+
+Keyboard
+   ↓
+Wrapper
+   ↓
+Real Claude Code
+   ↓
+PTY
+   ↓
+Terminal
+
+Wrapper responsibilities:
+
+1. Detect project
+2. Load memory
+3. Launch Claude
+4. Proxy terminal I/O
+5. Record session
+6. Summarize when appropriate
+7. Store memories
+8. Retrieve memories next session
+
+---
+
+# 5. Repository Structure
+
+```text
+claude-memory/
+│
+├── README.md
+├── pyproject.toml
+├── .env
+├── config.yaml
+│
+├── cli/
+│   ├── __init__.py
+│   ├── main.py                 # Entry point (myclaude)
+│   ├── launcher.py             # Starts Claude Code
+│   ├── prompt_builder.py       # Builds initial prompt
+│   └── session.py              # Session lifecycle
+│
+├── interceptor/
+│   ├── terminal.py             # Intercepts stdin/stdout
+│   ├── logger.py               # Records messages
+│   ├── tool_events.py          # Parses Claude tool activity
+│   └── idle_detector.py
+│
+├── memory/
+│   ├── extractor.py            # Calls LLM to summarize
+│   ├── classifier.py           # Decision/Bug/TODO/etc.
+│   ├── deduplicator.py
+│   ├── importance.py
+│   └── merger.py
+│
+├── retrieval/
+│   ├── search.py               # Semantic search
+│   ├── ranking.py
+│   ├── filters.py
+│   └── injector.py             # Adds memories to prompt
+│
+├── embeddings/
+│   ├── generator.py
+│   ├── similarity.py
+│   └── cache.py
+│
+├── storage/
+│   ├── sqlite.py
+│   ├── schema.sql
+│   ├── repositories.py
+│   └── migrations.py
+│
+├── project/
+│   ├── detector.py             # Detect Git project
+│   ├── metadata.py
+│   └── file_index.py
+│
+├── models/
+│   ├── session.py
+│   ├── memory.py
+│   ├── message.py
+│   ├── project.py
+│   └── tool_event.py
+│
+├── prompts/
+│   ├── summarize.md
+│   ├── classify.md
+│   └── retrieve.md
+│
+├── utils/
+│   ├── config.py
+│   ├── logging.py
+│   ├── hashing.py
+│   └── time.py
+│
+├── tests/
+│
+└── data/
+    ├── memory.db
+    ├── embeddings/
+    └── logs/
+```
+
+---
+
+# 6. Session Lifecycle
+
+## Startup
+
+1. User runs `claude`.
+2. Wrapper starts.
+3. Detect Git/project.
+4. Open SQLite.
+5. Retrieve relevant memories.
+6. Build startup prompt.
+7. Launch real Claude in a PTY.
+
+## Runtime
+
+Wrapper remains almost idle.
+
+It simply:
+
+- proxies keyboard input
+- proxies Claude output
+- logs messages
+- records tool events
+- records file reads
+- records file edits
+- records shell commands
+
+Everything is stored inside a Session Buffer.
+
+## Shutdown
+
+Triggered by:
+
+- Claude exits
+- Ctrl+C
+- idle timeout
+- context reaches ~80%
+- optional hourly checkpoint
+
+Flow:
+
+Session Buffer
+→ Memory Extractor
+→ Structured JSON
+→ Deduplicate
+→ SQLite
+→ Generate embeddings
+
+---
+
+# 7. Session Buffer
+
+Buffered information:
+
+- user prompts
+- assistant responses
+- tool calls
+- files read
+- files edited
+- bash commands
+- timestamps
+- project metadata
+
+Nothing is summarized during active coding.
+
+---
+
+# 8. Memory Extraction
+
+Exactly ONE LLM call per session by default.
+
+Prompt objective:
+
+"What would still matter six months from now?"
+
+Extract:
+
+- Architecture
+- Decisions
+- Bugs
+- Fixes
+- TODOs
+- Lessons
+- User preferences
+- Interesting commands
+- File relationships
+
+Return structured JSON only.
+
+---
+
+# 9. Memory Categories
+
+- Architecture
+- Decision
+- Bug
+- Fix
+- Lesson Learned
+- TODO
+- User Preference
+- Command
+- Warning
+- File Relationship
+
+---
+
+# 10. Storage
+
+SQLite stores:
+
+- sessions
+- memories
+- projects
+- metadata
+
+Embeddings generated only for memory summaries.
+
+Do not embed every message.
+
+---
+
+# 11. Retrieval
+
+On next session:
+
+Prompt
+→ embedding
+→ semantic search
+→ project filter
+→ file filter
+→ ranking
+→ top memories
+→ prompt injection
+
+Only relevant memories are injected.
+
+---
+
+# 12. Memory Consolidation
+
+Never blindly append.
+
+Old Memory
+→ New Evidence
+→ Merge
+→ Updated Memory
+
+Memory is treated as a living knowledge base.
+
+---
+
+# 13. Cost Optimisation
+
+- No summarization per message.
+- One summarization call per session.
+- Embed summaries only.
+- Cache embeddings.
+- Retrieve only top-k memories.
+
+---
+
+# 14. Future Roadmap
+
+- File-centric memories
+- Project-centric memories
+- Git integration
+- Knowledge graph
+- Team memory
+- Plugin architecture
+- Dashboard
+
+Ultimate vision:
+
+Move from remembering conversations to remembering the codebase itself.
 
