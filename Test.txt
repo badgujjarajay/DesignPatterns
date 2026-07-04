@@ -1,335 +1,1602 @@
-# Claude Memory Wrapper — Comprehensive Technical Specification (spec.md)
+# Code Atlas — Design Specification
 
-> **Status:** Draft v1.0
->
-> **Goal:** Build a transparent wrapper around Claude Code that provides persistent, low-cost, project-aware memory without changing the Claude Code user experience.
-
----
-
-# 1. Vision
-
-The user should feel like they are using **Claude Code itself**.
-
-There should be:
-
-- No new UI
-- No new login
-- No new permissions
-- No changes to colors, keyboard shortcuts or terminal behavior
-
-The wrapper should simply make Claude "remember".
+> **Status:** Draft
+> **Date:** 2026-07-05
+> **Author:** AI-assisted design session
 
 ---
 
-# 2. Design Principles
+## 1. Overview
 
-- Claude Code is a black box. Never modify or fork it.
-- The wrapper surrounds Claude rather than replacing it.
-- Observe everything; interfere with nothing.
-- Store knowledge, not conversations.
-- Prefer one high-quality summarization over hundreds of tiny ones.
-- Keep all storage local.
-- Keep LLM cost extremely low.
-- Everything should be modular.
+### 1.1 What Is Code Atlas?
 
----
+Code Atlas is a **CLI-based code knowledge graph tool** that transforms large codebases into a queryable directed multigraph. It uses deterministic static analysis (AST parsing via tree-sitter) to extract structural entities (modules, classes, functions, variables) and their relationships (imports, calls, inheritance, type usage), then stores them in a portable SQLite-backed graph. Users query the graph via CLI commands to understand dependencies, trace workflows, assess blast radius, detect dead code, and map service boundaries.
 
-# 3. User Experience
+### 1.2 Problem Statement
 
-Current workflow:
+Developers working with large codebases (10K-50K files) face recurring challenges:
+- **Understanding a new codebase:** Where does a request enter? What calls what? How are packages organized?
+- **Assessing change impact:** If I modify this function, what breaks downstream?
+- **Refactoring safely:** What depends on this class? Can I move it without breaking consumers?
+- **Finding dead code:** What functions are never called? What imports are unused?
+- **Service decomposition:** In a monorepo, where are the natural service boundaries?
+- **Migration planning:** What are the transitive dependencies of this module? What would I need to extract?
 
-    $ claude
+These tasks require understanding the full codebase structure, not just individual files. Existing tools either require heavy infrastructure (Neo4j), depend on expensive LLM APIs, or lack the depth of analysis needed.
 
-Proposed workflow:
+### 1.3 Goals
 
-    $ claude
+1. **Zero infrastructure** — no databases to install, no servers to run, no API keys needed
+2. **Deterministic** — pure static analysis, no LLM dependency, reproducible results
+3. **Fast** — handle 50K-file monorepos; incremental updates in seconds
+4. **Portable** — everything stored in a `.code-atlas/` directory alongside the project
+5. **Extensible** — adding a new language requires writing one Python module
+6. **Comprehensive** — 8 analysis capabilities covering the most common codebase understanding tasks
+7. **Local-only** — no network calls, no cloud dependencies, no git integration required
 
-or
+### 1.4 Non-Goals
 
-    $ myclaude
+- **IDE integration** — Code Atlas is CLI-only for v1. IDE plugins are a future consideration.
+- **Real-time analysis** — Code Atlas runs on-demand (`code-atlas analyze`), not as a file watcher.
+- **Semantic/LLM analysis** — No natural language queries, no AI-inferred relationships. Pure static analysis.
+- **Build system integration** — Code Atlas analyzes source code, not build artifacts or dependency manifests (pom.xml, requirements.txt).
+- **Cross-language call resolution** — Python calling Java (or vice versa) is not resolved in v1.
+- **MCP server mode** — v1 is CLI-only. MCP protocol support is a future extension.
 
-The terminal should look identical because the real Claude process is still rendering the UI.
+### 1.5 Target Users
 
-Authentication remains Claude's responsibility.
-
----
-
-# 4. High-Level Architecture
-
-Keyboard
-   ↓
-Wrapper
-   ↓
-Real Claude Code
-   ↓
-PTY
-   ↓
-Terminal
-
-Wrapper responsibilities:
-
-1. Detect project
-2. Load memory
-3. Launch Claude
-4. Proxy terminal I/O
-5. Record session
-6. Summarize when appropriate
-7. Store memories
-8. Retrieve memories next session
+- Developers onboarding to large codebases
+- Tech leads assessing refactoring impact
+- Architects mapping service boundaries in monorepos
+- Anyone performing code reviews, migrations, or bug investigations in large Python/Java projects
 
 ---
 
-# 5. Repository Structure
+## 2. Architecture
 
-```text
-claude-memory/
-│
-├── README.md
-├── pyproject.toml
-├── .env
-├── config.yaml
-│
-├── cli/
-│   ├── __init__.py
-│   ├── main.py                 # Entry point (myclaude)
-│   ├── launcher.py             # Starts Claude Code
-│   ├── prompt_builder.py       # Builds initial prompt
-│   └── session.py              # Session lifecycle
-│
-├── interceptor/
-│   ├── terminal.py             # Intercepts stdin/stdout
-│   ├── logger.py               # Records messages
-│   ├── tool_events.py          # Parses Claude tool activity
-│   └── idle_detector.py
-│
-├── memory/
-│   ├── extractor.py            # Calls LLM to summarize
-│   ├── classifier.py           # Decision/Bug/TODO/etc.
-│   ├── deduplicator.py
-│   ├── importance.py
-│   └── merger.py
-│
-├── retrieval/
-│   ├── search.py               # Semantic search
-│   ├── ranking.py
-│   ├── filters.py
-│   └── injector.py             # Adds memories to prompt
-│
-├── embeddings/
-│   ├── generator.py
-│   ├── similarity.py
-│   └── cache.py
-│
-├── storage/
-│   ├── sqlite.py
-│   ├── schema.sql
-│   ├── repositories.py
-│   └── migrations.py
-│
-├── project/
-│   ├── detector.py             # Detect Git project
-│   ├── metadata.py
-│   └── file_index.py
-│
-├── models/
-│   ├── session.py
-│   ├── memory.py
-│   ├── message.py
-│   ├── project.py
-│   └── tool_event.py
-│
-├── prompts/
-│   ├── summarize.md
-│   ├── classify.md
-│   └── retrieve.md
-│
-├── utils/
-│   ├── config.py
-│   ├── logging.py
-│   ├── hashing.py
-│   └── time.py
-│
-├── tests/
-│
-└── data/
-    ├── memory.db
-    ├── embeddings/
-    └── logs/
+### 2.1 High-Level Architecture
+
+Code Atlas follows a **3-layer pipeline** architecture:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    CLI Layer                          │
+│   (click-based commands: init, analyze, query,       │
+│    blast-radius, visualize, report, etc.)             │
+└──────────────────────┬──────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────┐
+│               Analysis Engine                        │
+│   8 language-agnostic analyzers operating on the     │
+│   graph topology (dependency, call graph, blast      │
+│   radius, hierarchy, dead code, boundaries, flow     │
+│   tracer, service mapper)                            │
+└──────────────────────┬──────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────┐
+│                Graph Core                            │
+│   ┌────────────────┐  ┌───────────────────────────┐ │
+│   │  Graph Model   │  │ Persistence (SQLite)      │ │
+│   │  (networkx     │  │ + File Hash Index         │ │
+│   │   DiGraph)     │  │ + Incremental Updates     │ │
+│   └───────┬────────┘  └───────────────────────────┘ │
+│           │                                          │
+│   ┌───────▼──────────────────────────────────────┐  │
+│   │          Language Adapters                     │  │
+│   │   ┌──────────────┐  ┌──────────────────┐     │  │
+│   │   │   Python     │  │   Java           │     │  │
+│   │   │   Adapter    │  │   Adapter        │     │  │
+│   │   │ (tree-sitter │  │ (tree-sitter     │     │  │
+│   │   │  -python)    │  │  -java)          │     │  │
+│   │   └──────────────┘  └──────────────────┘     │  │
+│   └──────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+```
+
+### 2.2 Data Flow
+
+```
+Source Files (.py, .java)
+    │
+    ▼
+[Phase 1: Local Extraction]  ← per-file, parallelizable
+    │  Tree-sitter parse → CST
+    │  Adapter traverses CST → emits nodes + intra-file edges
+    │
+    ▼
+[Phase 2: Cross-File Resolution]  ← requires full graph
+    │  Resolve import targets to Module nodes
+    │  Resolve function calls to Function nodes
+    │  Resolve type references to Class nodes
+    │  Emit CALLS, EXTENDS, IMPLEMENTS, USES_TYPE edges
+    │
+    ▼
+[Graph Construction]
+    │  networkx DiGraph populated with all nodes + edges
+    │  Persisted to SQLite
+    │
+    ▼
+[Analysis / Query]
+    │  CLI commands invoke analyzers
+    │  Analyzers traverse graph topology
+    │  Results formatted and displayed
+```
+
+### 2.3 Key Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| **networkx for graph** | Rich algorithm library (BFS, DFS, shortest path, community detection), well-tested, Pythonic API. Memory is acceptable at 50K files (~2-4GB). |
+| **SQLite for persistence** | Zero-config, portable, single-file, ACID, excellent Python stdlib support. WAL mode for performance. |
+| **tree-sitter for parsing** | Language-agnostic, fast, produces concrete syntax trees, handles syntax errors gracefully, wide language support (30+). |
+| **Protocol for adapters** | Python's `typing.Protocol` enables structural subtyping — adapters don't need to inherit from a base class, just implement the right methods. |
+| **Two-phase extraction** | Phase 1 (per-file) is parallelizable. Phase 2 (cross-file) needs the full graph but is typically faster since it's just edge resolution. |
+| **File-hash incremental** | SHA-256 content hashing is fast and deterministic. Only re-parse files whose content actually changed. |
+
+---
+
+## 3. Graph Data Model
+
+### 3.1 Node Types
+
+All node types share a common set of base properties plus type-specific properties.
+
+#### Common Node Properties
+
+| Property | Type | Description |
+|---|---|---|
+| `id` | `str` | SHA-256 hash of `{language}:{fqn}`. Deterministic, stable across runs. |
+| `kind` | `str` | Node type: `Module`, `Package`, `Class`, `Function`, `Variable`, `Enum`, `Annotation` |
+| `fqn` | `str` | Fully qualified name (unique within the graph) |
+| `name` | `str` | Short name (e.g., `UserService`, `process_order`) |
+| `language` | `str` | `"python"` or `"java"` |
+| `file_path` | `str` | Absolute path to the source file |
+| `line_start` | `int` | Start line in source (1-indexed) |
+| `line_end` | `int` | End line in source (1-indexed) |
+
+#### Type-Specific Properties
+
+**Module** (a source file):
+| Property | Type | Description |
+|---|---|---|
+| `package` | `str` | Package this module belongs to |
+| `content_hash` | `str` | SHA-256 of file content |
+| `loc` | `int` | Lines of code |
+
+**Package** (a directory/package):
+| Property | Type | Description |
+|---|---|---|
+| `path` | `str` | Directory path |
+| `depth` | `int` | Nesting depth from project root |
+
+**Class** (class, interface, abstract class):
+| Property | Type | Description |
+|---|---|---|
+| `is_abstract` | `bool` | Whether class is abstract |
+| `is_interface` | `bool` | Whether it's an interface (Java) or Protocol (Python) |
+| `visibility` | `str` | `"public"`, `"private"`, `"protected"`, `"package"`, `"module"` |
+| `decorators` | `list[str]` | Applied decorators/annotations |
+| `superclasses` | `list[str]` | Direct superclass FQNs (for quick lookup) |
+| `interfaces` | `list[str]` | Implemented interface FQNs (for quick lookup) |
+
+**Function** (function, method, constructor):
+| Property | Type | Description |
+|---|---|---|
+| `class_fqn` | `str \| None` | FQN of containing class (None for module-level functions) |
+| `is_static` | `bool` | Whether method is static |
+| `is_constructor` | `bool` | `__init__` (Python), constructor (Java) |
+| `is_abstract` | `bool` | Abstract method |
+| `visibility` | `str` | Access modifier |
+| `parameters` | `list[dict]` | `[{"name": "x", "type": "int", "default": null}]` |
+| `return_type` | `str \| None` | Return type annotation if present |
+| `decorators` | `list[str]` | Applied decorators/annotations |
+| `complexity` | `int` | Cyclomatic complexity (number of decision points) |
+| `is_property` | `bool` | Python `@property` methods |
+
+**Variable** (module-level or class-level variables/constants):
+| Property | Type | Description |
+|---|---|---|
+| `type_annotation` | `str \| None` | Type hint if present |
+| `is_constant` | `bool` | ALL_CAPS naming convention or `final` keyword |
+| `scope` | `str` | `"module"`, `"class"`, `"instance"` |
+| `value_hint` | `str \| None` | String representation of simple literal values |
+
+**Enum**:
+| Property | Type | Description |
+|---|---|---|
+| `values` | `list[str]` | Enum member names |
+| `visibility` | `str` | Access modifier |
+
+**Annotation** (Java annotations, Python decorators):
+| Property | Type | Description |
+|---|---|---|
+| `arguments` | `dict` | Annotation arguments as key-value pairs |
+| `target_kind` | `str` | What it decorates: `"class"`, `"method"`, `"field"` |
+
+### 3.2 Edge Types
+
+| Edge Type | Source Node → Target Node | Description | Confidence |
+|---|---|---|---|
+| `IMPORTS` | Module → Module | File imports another file/module | EXTRACTED |
+| `CONTAINS` | Module → Class/Function/Variable/Enum | File contains a top-level definition | EXTRACTED |
+| `DEFINES_METHOD` | Class → Function | Class defines a method | EXTRACTED |
+| `DEFINES_FIELD` | Class → Variable | Class defines a field/attribute | EXTRACTED |
+| `CALLS` | Function → Function | Function calls another function | EXTRACTED or INFERRED |
+| `INSTANTIATES` | Function → Class | Function creates an instance of a class | EXTRACTED |
+| `EXTENDS` | Class → Class | Class inheritance (single or multiple) | EXTRACTED |
+| `IMPLEMENTS` | Class → Class | Interface/Protocol implementation | EXTRACTED |
+| `USES_TYPE` | Function → Class | Function references a type (param, return, local var) | EXTRACTED |
+| `OVERRIDES` | Function → Function | Method overrides a parent class method | INFERRED |
+| `DECORATES` | Annotation → Function/Class | Decorator/annotation applied to an entity | EXTRACTED |
+| `BELONGS_TO` | Module → Package | File belongs to a package | EXTRACTED |
+| `DEPENDS_ON` | Package → Package | Package-level dependency (derived from IMPORTS) | INFERRED |
+
+#### Edge Properties
+
+| Property | Type | Description |
+|---|---|---|
+| `kind` | `str` | Edge type string |
+| `source_id` | `str` | Source node ID |
+| `target_id` | `str` | Target node ID |
+| `file_path` | `str` | File where the relationship was detected |
+| `line` | `int` | Line number where the relationship occurs |
+| `confidence` | `str` | `"EXTRACTED"` (from AST) or `"INFERRED"` (heuristic) |
+
+### 3.3 Fully Qualified Name (FQN) Convention
+
+Every node is uniquely identified by a fully qualified name:
+
+**Python:**
+```
+project_root.package.subpackage.module.ClassName.method_name
+```
+Examples:
+- Module: `myapp.services.user_service`
+- Class: `myapp.services.user_service.UserService`
+- Method: `myapp.services.user_service.UserService.create_user`
+- Function: `myapp.utils.helpers.format_date`
+- Variable: `myapp.config.settings.DATABASE_URL`
+
+**Java:**
+```
+com.company.package.ClassName.methodName
+```
+Examples:
+- Module: `com.company.services.UserService` (Java file = class)
+- Class: `com.company.services.UserService`
+- Method: `com.company.services.UserService.createUser`
+- Inner class: `com.company.services.UserService.Builder`
+- Enum: `com.company.models.Status`
+
+**FQN Resolution Rules:**
+1. Python module FQN is derived from the file path relative to the project root, replacing `/` with `.` and stripping `.py`
+2. Java FQN uses the `package` declaration from the source file
+3. For Python files in directories without `__init__.py`, use the directory path as a namespace (not a package)
+4. Node IDs are `SHA-256(language + ":" + fqn)` — deterministic and collision-resistant
+
+---
+
+## 4. Language Adapter System
+
+### 4.1 Protocol Definition
+
+```python
+from typing import Protocol, Iterator, runtime_checkable
+from code_atlas.core.models import ParsedFile, GraphNode, GraphEdge
+from code_atlas.core.graph import CodeGraph
+
+@runtime_checkable
+class LanguageAnalyzer(Protocol):
+    """Protocol that all language adapters must implement.
+    
+    Adding a new language to Code Atlas requires implementing this protocol
+    in a new module under code_atlas/languages/.
+    """
+    
+    @property
+    def language(self) -> str:
+        """Language identifier, e.g., 'python', 'java'."""
+        ...
+    
+    @property
+    def file_extensions(self) -> tuple[str, ...]:
+        """File extensions this adapter handles, e.g., ('.py',), ('.java',)."""
+        ...
+    
+    def can_handle(self, file_path: str) -> bool:
+        """Return True if this adapter can parse the given file."""
+        ...
+    
+    def parse_file(self, file_path: str, content: bytes) -> ParsedFile:
+        """Parse a source file into a ParsedFile structure.
+        
+        Uses tree-sitter to produce a concrete syntax tree (CST).
+        The ParsedFile contains the CST root node plus file metadata.
+        Must handle syntax errors gracefully (partial parse is acceptable).
+        """
+        ...
+    
+    def extract_nodes(self, parsed: ParsedFile) -> Iterator[GraphNode]:
+        """Extract graph nodes from a parsed file.
+        
+        Yields: Module node, Class nodes, Function nodes, Variable nodes,
+        Enum nodes, Annotation nodes found in this file.
+        Each node has its properties fully populated.
+        """
+        ...
+    
+    def extract_edges(self, parsed: ParsedFile) -> Iterator[GraphEdge]:
+        """Extract intra-file edges from a parsed file.
+        
+        Yields: CONTAINS, DEFINES_METHOD, DEFINES_FIELD, DECORATES edges,
+        plus IMPORTS edges with potentially unresolved targets.
+        Cross-file edges (CALLS, EXTENDS, etc.) are resolved in Phase 2.
+        """
+        ...
+    
+    def resolve_references(
+        self, parsed: ParsedFile, graph: 'CodeGraph'
+    ) -> Iterator[GraphEdge]:
+        """Resolve cross-file references using the full graph.
+        
+        Called during Phase 2 after all files have been parsed.
+        Uses the graph to resolve import targets, function call targets,
+        type references, inheritance chains.
+        
+        Yields: CALLS, INSTANTIATES, EXTENDS, IMPLEMENTS, USES_TYPE,
+        OVERRIDES edges with resolved target node IDs.
+        """
+        ...
+    
+    def detect_entry_points(self, parsed: ParsedFile) -> Iterator[str]:
+        """Identify entry point function FQNs in this file.
+        
+        Used by dead code detection to determine reachability roots.
+        Examples: main(), __main__ block, @app.route handlers,
+        @Controller methods, test methods.
+        
+        Yields: FQNs of entry point functions.
+        """
+        ...
+```
+
+### 4.2 Core Data Classes
+
+```python
+from dataclasses import dataclass, field
+from typing import Any
+
+@dataclass(frozen=True)
+class GraphNode:
+    """A node in the code knowledge graph."""
+    id: str                           # SHA-256 of language:fqn
+    kind: str                         # Module, Class, Function, Variable, Enum, Annotation
+    fqn: str                          # Fully qualified name
+    name: str                         # Short name
+    language: str                     # "python" or "java"
+    file_path: str                    # Absolute file path
+    line_start: int                   # Start line (1-indexed)
+    line_end: int                     # End line (1-indexed)
+    properties: dict[str, Any] = field(default_factory=dict)  # Type-specific properties
+
+@dataclass(frozen=True)
+class GraphEdge:
+    """An edge in the code knowledge graph."""
+    kind: str                         # IMPORTS, CALLS, EXTENDS, etc.
+    source_id: str                    # Source node ID
+    target_id: str                    # Target node ID
+    file_path: str                    # Where the relationship was detected
+    line: int = 0                     # Line number
+    confidence: str = "EXTRACTED"     # EXTRACTED or INFERRED
+    properties: dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class ParsedFile:
+    """Result of parsing a single source file."""
+    file_path: str                    # Absolute path
+    language: str                     # "python" or "java"
+    content_hash: str                 # SHA-256 of file content
+    tree: Any                         # tree-sitter Tree object
+    source: bytes                     # Raw file content
+    errors: list[str] = field(default_factory=list)  # Parse errors/warnings
+```
+
+### 4.3 Two-Phase Extraction Pipeline
+
+**Phase 1 — Local Extraction (per-file, parallelizable):**
+
+```
+For each source file:
+  1. Read file content, compute SHA-256 hash
+  2. Check file_index: if hash unchanged, skip (incremental)
+  3. Select appropriate LanguageAnalyzer based on file extension
+  4. analyzer.parse_file(path, content) → ParsedFile
+  5. analyzer.extract_nodes(parsed) → yield GraphNode objects
+  6. analyzer.extract_edges(parsed) → yield GraphEdge objects (intra-file)
+  7. analyzer.detect_entry_points(parsed) → yield entry point FQNs
+  8. Collect all nodes and edges
+```
+
+Phase 1 is parallelized using `multiprocessing.Pool`. Each file is independent — no shared state between workers. Workers return serialized node/edge lists.
+
+**Phase 2 — Cross-File Resolution (sequential, requires full graph):**
+
+```
+For each parsed file:
+  1. analyzer.resolve_references(parsed, graph) → yield GraphEdge objects
+  2. For IMPORTS edges: resolve target module FQN → target Module node ID
+  3. For CALLS edges: resolve function name → target Function node ID
+     - Use import scope + class hierarchy for resolution
+  4. For EXTENDS/IMPLEMENTS edges: resolve class name → target Class node ID
+  5. For USES_TYPE edges: resolve type name → target Class node ID
+  6. For OVERRIDES edges: match method signatures against parent class methods
+  7. Add resolved edges to graph
+  8. Mark unresolvable references with confidence="INFERRED", resolved=false
+```
+
+### 4.4 Python Adapter Specifics
+
+**Tree-sitter grammar:** `tree-sitter-python`
+
+**Constructs handled:**
+
+| Construct | Node Type | Notes |
+|---|---|---|
+| `class Foo:` | Class | Including `dataclass`, `NamedTuple`, `Protocol` |
+| `class Foo(Base):` | Class + EXTENDS edge | Multiple inheritance: multiple EXTENDS edges |
+| `class Foo(Protocol):` | Class (`is_interface=True`) | |
+| `def foo():` | Function | Module-level function |
+| `def foo(self):` | Function (`class_fqn` set) | Instance method |
+| `@staticmethod` | Function (`is_static=True`) | |
+| `@classmethod` | Function (decorator tracked) | |
+| `@property` | Function (`is_property=True`) | |
+| `@decorator` | DECORATES edge | |
+| `import x` | IMPORTS edge | Target: module `x` |
+| `from x import y` | IMPORTS edge + specific entity | |
+| `from x import *` | IMPORTS edge (`is_wildcard=True`) | |
+| `from .module import x` | IMPORTS edge | Relative import resolved |
+| `x = value` | Variable (module-level) | |
+| `self.x = value` | Variable (instance field) | via DEFINES_FIELD |
+| `x: int = value` | Variable with type annotation | |
+| `X = Enum(...)` | Enum | |
+| `foo()` | CALLS edge | Resolved in Phase 2 |
+| `Foo()` | INSTANTIATES edge | Resolved in Phase 2 |
+| `x: Foo` | USES_TYPE edge | Resolved in Phase 2 |
+
+**Entry point detection:**
+- Functions named `main`
+- `if __name__ == "__main__":` blocks
+- Functions decorated with `@app.route`, `@click.command`, `@pytest.fixture`, `@pytest.mark.*`, `def test_*`
+- Functions decorated with `@celery.task`, `@dramatiq.actor`
+
+**Python-specific resolution:**
+- Relative imports resolved using `__init__.py` package structure
+- `__all__` used to determine public API for wildcard imports
+- Method Resolution Order (MRO) used for `OVERRIDES` detection
+
+### 4.5 Java Adapter Specifics
+
+**Tree-sitter grammar:** `tree-sitter-java`
+
+**Constructs handled:**
+
+| Construct | Node Type | Notes |
+|---|---|---|
+| `class Foo {}` | Class | |
+| `abstract class Foo {}` | Class (`is_abstract=True`) | |
+| `interface Foo {}` | Class (`is_interface=True`) | |
+| `enum Foo {}` | Enum | |
+| `record Foo() {}` | Class (treated as class) | |
+| `class Foo extends Bar` | Class + EXTENDS edge | |
+| `class Foo implements I` | Class + IMPLEMENTS edge | Multiple interfaces |
+| `void method() {}` | Function | |
+| `Foo() {}` | Function (`is_constructor=True`) | |
+| `static void m() {}` | Function (`is_static=True`) | |
+| `@Override` | OVERRIDES edge | |
+| `@Annotation` | DECORATES edge | |
+| `import x.y.z;` | IMPORTS edge | |
+| `import static x.y.z;` | IMPORTS edge (static import) | |
+| `import x.y.*;` | IMPORTS edge (`is_wildcard=True`) | |
+| `private int x;` | Variable | With visibility |
+| `static final X = v;` | Variable (`is_constant=True`) | |
+| `class Inner {}` | Class (nested) | FQN: `Outer.Inner` |
+| `new Foo()` | INSTANTIATES edge | |
+| `foo()` | CALLS edge | Resolved in Phase 2 |
+| `Foo x;` | USES_TYPE edge | Resolved in Phase 2 |
+
+**Entry point detection:**
+- `public static void main(String[] args)` methods
+- Classes/methods annotated with `@Controller`, `@RestController`, `@Service`, `@Component`, `@Bean`
+- Methods annotated with `@RequestMapping`, `@GetMapping`, `@PostMapping`, etc.
+- Methods annotated with `@Test`, `@BeforeEach`, `@AfterEach` (JUnit)
+- Classes annotated with `@SpringBootApplication`
+
+**Java-specific resolution:**
+- Package declarations determine FQN prefix
+- Wildcard imports resolved against known classes in the graph
+- Static imports resolved to specific methods/fields
+- Inner class references resolved via enclosing class scope
+- Generic type parameters extracted for `USES_TYPE` edges (e.g., `List<User>` → USES_TYPE to `User`)
+
+### 4.6 Adding a New Language
+
+To add TypeScript support (as an example):
+
+1. **Create** `src/code_atlas/languages/typescript_analyzer.py`
+2. **Implement** `TypeScriptAnalyzer` class satisfying the `LanguageAnalyzer` protocol:
+   - Set `language = "typescript"`, `file_extensions = (".ts", ".tsx")`
+   - Implement `parse_file()` using `tree-sitter-typescript`
+   - Implement `extract_nodes()` to handle TS-specific constructs (interfaces, type aliases, enums)
+   - Implement `extract_edges()` for intra-file relationships
+   - Implement `resolve_references()` for cross-file resolution
+   - Implement `detect_entry_points()` for entry point detection
+3. **Register** in `src/code_atlas/languages/__init__.py`:
+   ```python
+   LANGUAGE_REGISTRY: dict[str, type[LanguageAnalyzer]] = {
+       "python": PythonAnalyzer,
+       "java": JavaAnalyzer,
+       "typescript": TypeScriptAnalyzer,  # add this line
+   }
+   ```
+4. **Add dependency:** `pip install tree-sitter-typescript`
+
+No changes needed in the graph model, analysis engine, CLI, persistence layer, or visualization.
+
+---
+
+## 5. Analysis Engine
+
+All 8 analyzers operate on the graph topology and are completely language-agnostic. They are implemented as classes inheriting from a `BaseAnalyzer` abstract base class.
+
+### 5.1 Base Analyzer
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any
+
+@dataclass
+class AnalysisResult:
+    """Structured result from any analyzer."""
+    analyzer: str              # Analyzer name
+    query: dict[str, Any]      # Input parameters
+    nodes: list[dict]          # Result nodes with properties
+    edges: list[dict]          # Result edges (if applicable)
+    metrics: dict[str, Any]    # Computed metrics
+    warnings: list[str]        # Any warnings produced
+
+class BaseAnalyzer(ABC):
+    """Base class for all analyzers."""
+    
+    def __init__(self, graph: CodeGraph):
+        self.graph = graph
+    
+    @abstractmethod
+    def analyze(self, **kwargs) -> AnalysisResult:
+        """Run the analysis with the given parameters."""
+        ...
+```
+
+### 5.2 Dependency Analyzer
+
+**Purpose:** Answer "what does X depend on?" and "what depends on X?"
+
+**Input:** Any entity (module, class, function) identified by FQN or file path.
+
+**Capabilities:**
+- **Forward dependencies:** What does this entity depend on? Traverse outgoing `IMPORTS`, `CALLS`, `USES_TYPE`, `EXTENDS`, `IMPLEMENTS` edges.
+- **Reverse dependencies:** What depends on this entity? Traverse incoming edges of the same types.
+- **Transitive closure:** Follow dependency chains to configurable depth (default: unlimited).
+- **Dependency tree:** Render as an indented tree showing the full dependency hierarchy.
+- **Scope filtering:** Filter results by package, language, or node type.
+
+**Algorithm:**
+1. Locate the target node by FQN or file path
+2. BFS/DFS from the target following relevant edge types
+3. Track depth for each discovered node
+4. Apply depth limit if specified
+5. Build result tree preserving parent-child relationships
+
+**CLI:**
+```
+code-atlas deps <target> [--depth N] [--reverse] [--transitive] [--types module,class,function] [--format table|json|tree]
+```
+
+**Example output:**
+```
+Dependencies of myapp.services.UserService (depth=2):
+├── myapp.models.user.User (IMPORTS)
+│   ├── myapp.models.base.BaseModel (EXTENDS)
+│   └── myapp.db.session.Session (IMPORTS)
+├── myapp.repositories.user_repo.UserRepository (IMPORTS)
+│   └── myapp.db.session.Session (IMPORTS)
+└── myapp.utils.validators.validate_email (IMPORTS)
+
+3 direct dependencies, 5 transitive (depth 2)
+```
+
+### 5.3 Call Graph Analyzer
+
+**Purpose:** Answer "who calls whom?" — trace execution paths through the codebase.
+
+**Input:** A function FQN.
+
+**Capabilities:**
+- **Callees:** What functions does this function call? (forward call tree)
+- **Callers:** What functions call this function? (reverse call tree)
+- **Full call tree:** Both directions with depth limit.
+- **Call chain:** Find all call paths from function A to function B.
+- **Entry point discovery:** What entry points can reach this function?
+
+**Algorithm:**
+1. Locate the target Function node
+2. Traverse `CALLS` edges (forward or reverse depending on mode)
+3. Track full paths for chain discovery
+4. For entry point discovery: reverse BFS to find nodes with no incoming `CALLS` edges (or flagged as entry points)
+
+**CLI:**
+```
+code-atlas callgraph <function-fqn> [--callers] [--callees] [--depth N] [--chain-to <target-fqn>] [--format table|json|tree]
+```
+
+**Example output:**
+```
+Call tree of myapp.services.UserService.create_user (callees, depth=3):
+├── myapp.repositories.user_repo.UserRepository.save
+│   ├── myapp.db.session.Session.add
+│   └── myapp.db.session.Session.commit
+├── myapp.utils.validators.validate_email
+│   └── re.match (external)
+└── myapp.events.publisher.publish_event
+    └── myapp.queue.redis_queue.enqueue
+
+5 functions called (depth 3), 1 external reference
+```
+
+### 5.4 Blast Radius Analyzer
+
+**Purpose:** Answer "if I change X, what could break?"
+
+**Input:** A file path, function FQN, or class FQN.
+
+**Capabilities:**
+- **Impact assessment:** All transitively affected entities, grouped by hop distance.
+- **Impact levels:** Direct (1 hop), Indirect (2+ hops), with distance shown.
+- **Affected files:** Unique list of files that contain affected entities.
+- **Affected tests:** Filter to test files/functions in the blast radius.
+- **Risk scoring:** Higher connectivity = higher risk score.
+
+**Algorithm:**
+1. Identify all nodes in the target (if target is a file, get all nodes in that file)
+2. Multi-source BFS on **reverse** dependency edges: traverse incoming `CALLS`, `IMPORTS`, `USES_TYPE`, `EXTENDS`, `IMPLEMENTS` edges
+3. Track distance from source for each discovered node
+4. Group results by distance
+5. Compute risk score: `score = Σ (1/distance) * node_connectivity`
+
+**CLI:**
+```
+code-atlas blast-radius <target> [--depth N] [--tests-only] [--files-only] [--format table|json|html]
+```
+
+**Example output:**
+```
+Blast radius of myapp.models.user.User:
+
+Distance 1 (direct dependents):
+  myapp.services.user_service.UserService         class     EXTENDS
+  myapp.repositories.user_repo.UserRepository      class     USES_TYPE
+  myapp.serializers.user_serializer.UserSerializer  class     USES_TYPE
+
+Distance 2:
+  myapp.api.views.user_views.create_user           function  CALLS → UserService
+  myapp.api.views.user_views.list_users            function  CALLS → UserRepository
+
+Affected files: 4
+Affected tests: tests/test_user_service.py, tests/test_user_views.py
+Risk score: 7.3 (HIGH)
+```
+
+### 5.5 Type Hierarchy Analyzer
+
+**Purpose:** Answer "what is the class hierarchy?" — inheritance and implementation trees.
+
+**Input:** A class FQN or "all" for the full hierarchy.
+
+**Capabilities:**
+- **Ancestors:** Traverse `EXTENDS` and `IMPLEMENTS` edges upward.
+- **Descendants:** Traverse `EXTENDS` and `IMPLEMENTS` edges downward (reverse).
+- **Full hierarchy:** Complete tree from root classes down.
+- **Overrides map:** For a class, show which methods override parent methods.
+- **Diamond detection:** Find classes with multiple inheritance paths to the same ancestor.
+
+**Algorithm:**
+1. Locate the target Class node
+2. For ancestors: BFS on outgoing `EXTENDS` / `IMPLEMENTS` edges
+3. For descendants: BFS on incoming `EXTENDS` / `IMPLEMENTS` edges
+4. For overrides: match `OVERRIDES` edges from the class's methods
+5. For diamond detection: find nodes reachable via multiple paths in the ancestor tree
+
+**CLI:**
+```
+code-atlas hierarchy <class-fqn> [--ancestors] [--descendants] [--all] [--overrides] [--format table|json|tree]
+```
+
+**Example output:**
+```
+Type hierarchy of myapp.services.UserService:
+
+Ancestors:
+  └── myapp.services.base.BaseService
+      └── abc.ABC
+
+Descendants:
+  ├── myapp.services.admin_user_service.AdminUserService
+  └── myapp.services.guest_user_service.GuestUserService
+
+Overrides:
+  create_user    overrides  BaseService.create_user
+  validate       overrides  BaseService.validate
+```
+
+### 5.6 Dead Code Detector
+
+**Purpose:** Find unreachable code — functions never called, imports never used, orphan classes.
+
+**Input:** Entire graph, optionally scoped to a package.
+
+**Capabilities:**
+- **Unreachable functions:** Functions with no incoming `CALLS` edges and not identified as entry points.
+- **Unused imports:** Import edges where the target module/entity is never referenced beyond the import statement itself.
+- **Orphan classes:** Classes with no incoming `EXTENDS`, `IMPLEMENTS`, `INSTANTIATES`, or `USES_TYPE` edges.
+- **Scope filtering:** Analyze only a specific package.
+- **Test awareness:** Option to include or exclude test files from analysis.
+
+**Algorithm:**
+1. **Entry point collection:** Gather all nodes flagged as entry points by language adapters.
+2. **Reachability analysis:** BFS from all entry points following `CALLS` edges. Mark all reached Function nodes.
+3. **Unreachable detection:** All Function nodes not reached = potentially dead.
+4. **Import analysis:** For each IMPORTS edge, check if the target module/entity has any other incoming edges from the same source module (beyond the IMPORTS edge itself).
+5. **Orphan analysis:** Classes with zero incoming `EXTENDS`, `IMPLEMENTS`, `INSTANTIATES`, `USES_TYPE` edges (excluding self-references).
+6. **False positive reduction:**
+   - Exclude `__init__`, `__str__`, `__repr__` and other dunder methods
+   - Exclude methods decorated with known framework decorators
+   - Exclude public methods in public classes (may be used externally)
+   - Report confidence level for each finding
+
+**CLI:**
+```
+code-atlas dead-code [--scope <package>] [--include-tests] [--category functions|imports|classes|all] [--format table|json]
+```
+
+**Example output:**
+```
+Dead code analysis (scope: myapp):
+
+Unreachable Functions (5):
+  myapp.utils.deprecated.old_format       utils/deprecated.py:12    LIKELY_DEAD
+  myapp.services.legacy.process_v1        services/legacy.py:45     LIKELY_DEAD
+  myapp.helpers.unused_helper             helpers/__init__.py:23    LIKELY_DEAD
+  myapp.services.user_service._temp_fix   services/user_service.py:89  LIKELY_DEAD
+  myapp.models.user.User.legacy_method    models/user.py:67        POSSIBLY_DEAD (public method)
+
+Unused Imports (3):
+  myapp/views/admin.py:3    import json           UNUSED
+  myapp/services/auth.py:5  from os import path    UNUSED
+  myapp/utils/helpers.py:1  import re              UNUSED
+
+Orphan Classes (1):
+  myapp.models.legacy.OldUser             models/legacy.py:5       NO_REFERENCES
+
+Summary: 5 dead functions, 3 unused imports, 1 orphan class
+```
+
+### 5.7 Cross-Module Boundary Analyzer
+
+**Purpose:** Understand package structure, coupling metrics, and boundary violations.
+
+**Input:** Entire graph, optionally focused on a specific package.
+
+**Capabilities:**
+- **Coupling matrix:** Package-to-package dependency counts.
+- **Coupling metrics:** Afferent coupling (Ca), efferent coupling (Ce), instability (I = Ce / (Ca + Ce)).
+- **Boundary violations:** Internal (non-public) entities accessed from outside their package.
+- **Dependency direction:** Identify packages with bidirectional dependencies (potential architectural issues).
+- **Package health report:** Highlight packages with high coupling, low cohesion.
+
+**Algorithm:**
+1. **Group nodes by package:** Aggregate all nodes into their containing packages.
+2. **Build package graph:** Create a derived graph where packages are nodes and inter-package edges are weighted by the number of cross-package entity references.
+3. **Coupling metrics:**
+   - Ca (afferent) = number of packages that depend on this package
+   - Ce (efferent) = number of packages this package depends on
+   - I (instability) = Ce / (Ca + Ce). I=0 is maximally stable, I=1 is maximally unstable.
+4. **Boundary violations:** For each cross-package edge, check if the target entity's visibility allows external access:
+   - Python: entities starting with `_` are internal by convention
+   - Java: `private` and `package-private` entities should not be accessed externally
+5. **Bidirectional detection:** Find package pairs where edges exist in both directions.
+
+**CLI:**
+```
+code-atlas boundaries [--package <pkg>] [--violations-only] [--bidirectional] [--format table|json|html]
+```
+
+**Example output:**
+```
+Package Boundary Analysis:
+
+Coupling Metrics:
+  Package                    Ca    Ce    Instability
+  myapp.models               8     2     0.20 (stable)
+  myapp.services             3     5     0.63
+  myapp.api                  1     4     0.80 (unstable)
+  myapp.utils                6     1     0.14 (stable)
+  myapp.repositories         4     3     0.43
+
+Boundary Violations (3):
+  myapp.api.views → myapp.services._internal_helper    PRIVATE ACCESS
+  myapp.services → myapp.models.user._validate_email   PRIVATE ACCESS
+  myapp.api → myapp.repositories._build_query          PRIVATE ACCESS
+
+Bidirectional Dependencies (1):
+  myapp.services ↔ myapp.repositories    (potential circular architecture)
+```
+
+### 5.8 Workflow/Flow Tracer
+
+**Purpose:** Trace a request or data flow from an entry point through the entire system.
+
+**Input:** A starting function (entry point), optionally a target function.
+
+**Capabilities:**
+- **Forward trace:** From entry point, show all reachable functions (call tree).
+- **Targeted trace:** Find all call paths from entry point to a specific target function.
+- **Path enumeration:** List all distinct execution paths (with depth limit to prevent explosion).
+- **Layer crossing:** Show when the flow crosses package/module boundaries.
+
+**Algorithm:**
+1. Locate the entry Function node.
+2. **Forward trace:** BFS on `CALLS` edges with depth limit. Build a tree of all reachable functions.
+3. **Targeted trace:** DFS with path tracking. Find all simple paths from entry to target (no cycles). Apply depth limit.
+4. For each path, annotate package crossings.
+5. Limit to `max_paths` (default: 20) to prevent combinatorial explosion.
+
+**CLI:**
+```
+code-atlas trace <entry-function> [--to <target-function>] [--depth N] [--max-paths N] [--format table|json|tree]
+```
+
+**Example output:**
+```
+Flow trace from myapp.api.views.create_user_endpoint to myapp.db.session.Session.commit:
+
+Path 1 (5 hops):
+  myapp.api.views.create_user_endpoint       [api]
+  → myapp.services.user_service.create_user  [services]
+  → myapp.repositories.user_repo.save        [repositories]
+  → myapp.db.session.Session.add             [db]
+  → myapp.db.session.Session.commit          [db]
+
+Path 2 (4 hops):
+  myapp.api.views.create_user_endpoint       [api]
+  → myapp.services.user_service.create_user  [services]
+  → myapp.db.session.Session.add             [db]
+  → myapp.db.session.Session.commit          [db]
+
+2 paths found (depth limit: 10)
+```
+
+### 5.9 Service Boundary Mapper
+
+**Purpose:** In monorepos, identify logical service boundaries — clusters of packages that form cohesive services.
+
+**Input:** Entire graph.
+
+**Capabilities:**
+- **Community detection:** Use Leiden algorithm to find clusters of highly-cohesive packages.
+- **Service map:** Name each service boundary, list its constituent packages.
+- **Inter-service interfaces:** Identify edges crossing service boundaries — these are the "API surface" between services.
+- **Coupling strength:** Quantify how tightly services are coupled.
+- **Decomposition suggestions:** Based on coupling metrics, suggest which services could be cleanly extracted.
+
+**Algorithm:**
+1. Build the package-level dependency graph (from the Boundary Analyzer's derived graph).
+2. Apply Leiden community detection (via networkx's `community` module or `leidenalg`).
+3. Each community = one logical service.
+4. Name services based on dominant package names.
+5. Compute inter-community edges and coupling strength.
+6. Calculate extraction difficulty: `difficulty = inter_service_edges / total_edges_involving_service`.
+
+**CLI:**
+```
+code-atlas services [--min-size N] [--algorithm leiden|louvain] [--format table|json|html]
+```
+
+**Example output:**
+```
+Service Boundary Map:
+
+Service 1: "user-management" (4 packages)
+  Packages: myapp.models.user, myapp.services.user, myapp.repositories.user, myapp.api.user
+  Internal cohesion: 0.82
+
+Service 2: "billing" (3 packages)
+  Packages: myapp.models.billing, myapp.services.billing, myapp.api.billing
+  Internal cohesion: 0.91
+
+Service 3: "shared-core" (3 packages)
+  Packages: myapp.utils, myapp.db, myapp.config
+  Internal cohesion: 0.65
+
+Inter-service Dependencies:
+  user-management → shared-core      strength: 12 edges (MODERATE)
+  billing → shared-core              strength: 8 edges (LOW)
+  user-management → billing           strength: 3 edges (LOW)
+
+Extraction Readiness:
+  billing:          EASY   (3 inter-service edges, 91% cohesion)
+  user-management:  MODERATE (15 inter-service edges, 82% cohesion)
+  shared-core:      HARD   (20 inter-service edges, shared by all)
 ```
 
 ---
 
-# 6. Session Lifecycle
+## 6. CLI Interface
 
-## Startup
+### 6.1 Command Overview
 
-1. User runs `claude`.
-2. Wrapper starts.
-3. Detect Git/project.
-4. Open SQLite.
-5. Retrieve relevant memories.
-6. Build startup prompt.
-7. Launch real Claude in a PTY.
+```
+code-atlas <command> [options]
 
-## Runtime
+Commands:
+  init           Initialize Code Atlas for a project
+  analyze        Parse codebase and build/update the knowledge graph
+  status         Show graph statistics and analysis status
+  query          Search for entities by name pattern
+  deps           Analyze dependencies of an entity
+  callgraph      Show call graph for a function
+  blast-radius   Assess impact of changing an entity
+  hierarchy      Show type/class hierarchy
+  dead-code      Detect unreachable code, unused imports, orphan classes
+  boundaries     Analyze package boundaries and coupling
+  trace          Trace execution flow between functions
+  services       Map logical service boundaries
+  visualize      Generate interactive HTML visualization
+  report         Generate a comprehensive codebase report
+  export         Export raw graph data
+```
 
-Wrapper remains almost idle.
+### 6.2 Global Options
 
-It simply:
+```
+--verbose, -v       Show detailed progress and timing info
+--format, -f        Output format: table (default), json, tree
+--no-color          Disable colored output
+--config PATH       Use custom config file (default: .code-atlas/config.toml)
+```
 
-- proxies keyboard input
-- proxies Claude output
-- logs messages
-- records tool events
-- records file reads
-- records file edits
-- records shell commands
+### 6.3 Entity Targeting
 
-Everything is stored inside a Session Buffer.
+All commands that accept a `<target>` argument support multiple targeting modes:
 
-## Shutdown
+| Mode | Syntax | Example |
+|---|---|---|
+| FQN (exact) | `package.module.Class.method` | `myapp.services.UserService.create_user` |
+| File path | `path/to/file.py` | `src/services/user_service.py` |
+| Glob pattern | `*.ClassName` | `*.UserService` |
+| Package glob | `package.**` | `myapp.services.**` |
+| Fuzzy search | `:search_term` | `:user service` |
 
-Triggered by:
+### 6.4 Command Details
 
-- Claude exits
-- Ctrl+C
-- idle timeout
-- context reaches ~80%
-- optional hourly checkpoint
+**`code-atlas init`**
+```
+code-atlas init [--languages python,java] [--exclude PATTERN...] [--root PATH]
 
-Flow:
+Options:
+  --languages    Comma-separated list of languages to analyze (default: auto-detect)
+  --exclude      Glob patterns to exclude (default: __pycache__, .git, node_modules, venv, .venv, build, dist, target, .idea, .vscode)
+  --root         Project root directory (default: current directory)
 
-Session Buffer
-→ Memory Extractor
-→ Structured JSON
-→ Deduplicate
-→ SQLite
-→ Generate embeddings
+Creates:
+  .code-atlas/config.toml    Project configuration
+```
 
----
+**`code-atlas analyze`**
+```
+code-atlas analyze [--incremental] [--rebuild] [--parallel N] [--verbose]
 
-# 7. Session Buffer
+Options:
+  --incremental   Only re-parse changed files (default behavior)
+  --rebuild        Wipe and rebuild the entire graph from scratch
+  --parallel N     Number of parallel workers (default: CPU count)
+  --verbose        Show per-file parsing progress
 
-Buffered information:
+Phases:
+  1. File discovery and hash comparison
+  2. Parallel AST parsing (Phase 1)
+  3. Cross-file reference resolution (Phase 2)
+  4. Graph persistence to SQLite
+  5. Statistics summary
+```
 
-- user prompts
-- assistant responses
-- tool calls
-- files read
-- files edited
-- bash commands
-- timestamps
-- project metadata
+**`code-atlas status`**
+```
+code-atlas status
 
-Nothing is summarized during active coding.
+Output:
+  Project: /path/to/project
+  Languages: Python (12,345 files), Java (8,901 files)
+  Graph: 45,678 nodes, 123,456 edges
+  Last analyzed: 2026-07-05 03:00:00 (2 hours ago)
+  Stale files: 23 (run 'code-atlas analyze' to update)
+  Parse errors: 3 files (run 'code-atlas status --errors' for details)
+```
 
----
+**`code-atlas query`**
+```
+code-atlas query <pattern> [--type class|function|module|variable] [--package PKG] [--limit N]
 
-# 8. Memory Extraction
+Fuzzy search for entities. Supports glob patterns and substring matching.
 
-Exactly ONE LLM call per session by default.
+Example:
+  code-atlas query "UserService"
+  code-atlas query "*.create_*" --type function
+  code-atlas query ":user" --limit 20
+```
 
-Prompt objective:
+**`code-atlas visualize`**
+```
+code-atlas visualize [--scope all|package|blast-radius] [--target TARGET] [--output FILE] [--open]
 
-"What would still matter six months from now?"
+Options:
+  --scope       What to visualize (default: all)
+  --target      Target entity for scoped views (required for package/blast-radius)
+  --output      Output file path (default: .code-atlas/graph.html)
+  --open        Open the generated file in the default browser
 
-Extract:
+Generates a standalone HTML file with interactive D3.js force-directed graph.
+```
 
-- Architecture
-- Decisions
-- Bugs
-- Fixes
-- TODOs
-- Lessons
-- User preferences
-- Interesting commands
-- File relationships
+**`code-atlas report`**
+```
+code-atlas report [--output FILE] [--sections all|summary|deps|dead-code|boundaries|services]
 
-Return structured JSON only.
+Generates a comprehensive Markdown report covering:
+  - Codebase summary (languages, files, LOC, entity counts)
+  - Package structure overview
+  - Key metrics (coupling, cohesion, instability)
+  - Dead code summary
+  - Service boundary map
+  - Top-10 most connected entities (hotspots)
 
----
+Output: Markdown file (default: .code-atlas/report.md)
+```
 
-# 9. Memory Categories
+**`code-atlas export`**
+```
+code-atlas export [--format json|graphml|dot] [--output FILE]
 
-- Architecture
-- Decision
-- Bug
-- Fix
-- Lesson Learned
-- TODO
-- User Preference
-- Command
-- Warning
-- File Relationship
-
----
-
-# 10. Storage
-
-SQLite stores:
-
-- sessions
-- memories
-- projects
-- metadata
-
-Embeddings generated only for memory summaries.
-
-Do not embed every message.
-
----
-
-# 11. Retrieval
-
-On next session:
-
-Prompt
-→ embedding
-→ semantic search
-→ project filter
-→ file filter
-→ ranking
-→ top memories
-→ prompt injection
-
-Only relevant memories are injected.
-
----
-
-# 12. Memory Consolidation
-
-Never blindly append.
-
-Old Memory
-→ New Evidence
-→ Merge
-→ Updated Memory
-
-Memory is treated as a living knowledge base.
+Exports the raw graph in standard formats for use with external tools.
+  json:     Nodes and edges as JSON arrays
+  graphml:  GraphML format (compatible with Gephi, yEd)
+  dot:      Graphviz DOT format
+```
 
 ---
 
-# 13. Cost Optimisation
+## 7. Persistence Layer
 
-- No summarization per message.
-- One summarization call per session.
-- Embed summaries only.
-- Cache embeddings.
-- Retrieve only top-k memories.
+### 7.1 Directory Structure
+
+```
+.code-atlas/
+├── config.toml          # Project configuration
+├── graph.db             # SQLite database (nodes, edges, file_index)
+└── cache/               # Optional cache directory
+    └── parse_cache/     # Cached parsed file metadata (optional, for speed)
+```
+
+### 7.2 Configuration File
+
+```toml
+# .code-atlas/config.toml
+
+[project]
+name = "my-project"
+root = "."
+
+[analysis]
+languages = ["python", "java"]
+parallel_workers = 8                    # 0 = auto (CPU count)
+
+[analysis.exclude]
+patterns = [
+    "__pycache__",
+    ".git",
+    "node_modules",
+    "venv",
+    ".venv",
+    "build",
+    "dist",
+    "target",
+    ".idea",
+    ".vscode",
+    "*.pyc",
+    "*.class",
+    ".code-atlas",
+]
+
+[analysis.python]
+# Python-specific settings
+follow_init_imports = true              # Follow __init__.py re-exports
+detect_entry_points = ["main", "test_*", "app.route", "click.command"]
+
+[analysis.java]
+# Java-specific settings
+detect_entry_points = ["main", "@Controller", "@RestController", "@Test"]
+
+[visualization]
+max_nodes = 5000                        # Limit for HTML visualization performance
+color_scheme = "type"                   # Color by: type, package, language
+```
+
+### 7.3 SQLite Schema
+
+```sql
+-- Core tables
+CREATE TABLE nodes (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    fqn TEXT NOT NULL,
+    name TEXT NOT NULL,
+    language TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    line_start INTEGER DEFAULT 0,
+    line_end INTEGER DEFAULT 0,
+    properties TEXT NOT NULL DEFAULT '{}'   -- JSON blob
+);
+
+CREATE TABLE edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    file_path TEXT DEFAULT '',
+    line INTEGER DEFAULT 0,
+    confidence TEXT NOT NULL DEFAULT 'EXTRACTED',
+    properties TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (source_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (target_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    UNIQUE(kind, source_id, target_id)
+);
+
+CREATE TABLE file_index (
+    path TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    last_analyzed TEXT NOT NULL,
+    language TEXT NOT NULL,
+    node_count INTEGER DEFAULT 0,
+    edge_count INTEGER DEFAULT 0,
+    parse_errors TEXT DEFAULT '[]'         -- JSON array of error strings
+);
+
+CREATE TABLE metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+-- Stores: schema_version, last_full_analyze, project_root
+
+-- Performance indexes
+CREATE INDEX idx_nodes_kind ON nodes(kind);
+CREATE INDEX idx_nodes_fqn ON nodes(fqn);
+CREATE INDEX idx_nodes_name ON nodes(name);
+CREATE INDEX idx_nodes_file ON nodes(file_path);
+CREATE INDEX idx_nodes_language ON nodes(language);
+CREATE INDEX idx_edges_kind ON edges(kind);
+CREATE INDEX idx_edges_source ON edges(source_id);
+CREATE INDEX idx_edges_target ON edges(target_id);
+CREATE INDEX idx_edges_source_kind ON edges(source_id, kind);
+CREATE INDEX idx_edges_target_kind ON edges(target_id, kind);
+```
+
+### 7.4 Incremental Update Strategy
+
+```
+1. Scan project directory for all source files matching configured extensions
+2. For each file:
+   a. Compute SHA-256 content hash
+   b. Look up file in file_index table
+   c. If hash matches → skip (unchanged)
+   d. If hash differs → mark for re-parse (changed)
+   e. If not in index → mark for parse (new)
+3. For files in index but not on disk → mark for deletion (removed)
+4. Delete all nodes and edges associated with changed/removed files
+5. Parse changed/new files (Phase 1, parallel)
+6. Insert new nodes and edges
+7. Run cross-file resolution (Phase 2) for changed files
+8. Update file_index with new hashes
+9. Report: N files parsed, M files skipped, K files removed
+```
+
+**Performance notes:**
+- File hash computation is fast (SHA-256 of file content)
+- SQLite deletions are batched in transactions of 5000 rows
+- Insertions use `executemany` for batch efficiency
+- WAL (Write-Ahead Logging) mode enabled for concurrent reads during writes
+- `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;` for write performance
 
 ---
 
-# 14. Future Roadmap
+## 8. Visualization
 
-- File-centric memories
-- Project-centric memories
-- Git integration
-- Knowledge graph
-- Team memory
-- Plugin architecture
-- Dashboard
+### 8.1 Interactive HTML Report
 
-Ultimate vision:
+The `visualize` command generates a standalone HTML file with:
 
-Move from remembering conversations to remembering the codebase itself.
+**Core features:**
+- **D3.js force-directed graph** layout
+- **Node representation:** Circles colored by type, sized by connectivity degree
+- **Edge representation:** Lines colored by relationship type, with arrowheads
+- **Zoom & pan:** Mouse wheel zoom, click-drag to pan
+- **Node drag:** Click-drag individual nodes to rearrange
+- **Hover tooltips:** Show node FQN, type, file path, line numbers
+- **Click selection:** Click a node to highlight it and all its neighbors
 
+**Interactive controls (sidebar):**
+- **Search bar:** Type-ahead search to find and focus on entities
+- **Node type filters:** Toggle visibility of each node type (Module, Class, Function, etc.)
+- **Edge type filters:** Toggle visibility of each edge type (IMPORTS, CALLS, EXTENDS, etc.)
+- **Package filter:** Show only nodes in selected package(s)
+- **Layout controls:** Force strength, link distance, charge strength sliders
+- **Info panel:** Selected node details — FQN, properties, connections, source location
+
+**Color scheme (by node type):**
+| Node Type | Color |
+|---|---|
+| Module | `#FF9800` (orange) |
+| Package | `#795548` (brown) |
+| Class | `#2196F3` (blue) |
+| Function | `#4CAF50` (green) |
+| Variable | `#9C27B0` (purple) |
+| Enum | `#F44336` (red) |
+| Annotation | `#607D8B` (blue-grey) |
+
+**Edge color scheme:**
+| Edge Type | Color |
+|---|---|
+| IMPORTS | `#999999` (grey) |
+| CALLS | `#4CAF50` (green) |
+| EXTENDS | `#2196F3` (blue) |
+| IMPLEMENTS | `#00BCD4` (cyan) |
+| USES_TYPE | `#FF9800` (orange) |
+| CONTAINS | `#EEEEEE` (light grey, subtle) |
+
+**Scoped visualizations:**
+- `--scope package --target myapp.services`: Only nodes in that package + their external connections
+- `--scope blast-radius --target myapp.models.User`: Visualize the blast radius of a change
+
+**Performance:** For graphs exceeding `max_nodes` (configurable, default 5000), the visualization automatically:
+1. Collapses packages into single nodes
+2. Shows only the most-connected nodes
+3. Provides a warning with the total node count
+
+### 8.2 HTML Template Architecture
+
+The HTML file is fully self-contained:
+- **No external dependencies** — all CSS/JS inline
+- **D3.js (v7)** included inline via CDN fallback
+- **Graph data** embedded as a JSON blob in a `<script>` tag
+- **Jinja2 template** (`templates/graph.html`) renders the final file
+
+---
+
+## 9. Performance Strategy
+
+### 9.1 Performance Targets
+
+| Operation | Target (50K files) |
+|---|---|
+| Full initial scan | 3-8 minutes |
+| Incremental update (100 changed files) | 5-15 seconds |
+| Query (blast radius, depth 5) | <1 second |
+| Query (dead code detection) | <5 seconds |
+| Graph load from SQLite to memory | 10-30 seconds |
+| Visualization generation | <10 seconds |
+
+### 9.2 Performance Techniques
+
+| Technique | Applied To | Implementation |
+|---|---|---|
+| **Parallel parsing** | Phase 1 (file parsing) | `multiprocessing.Pool(workers)`. Each file is independent. Workers return serialized node/edge lists. |
+| **Batch SQLite writes** | Persistence layer | `executemany()` with transaction batches of 5000 rows. |
+| **WAL mode** | SQLite | `PRAGMA journal_mode=WAL` for concurrent read during write. |
+| **Lazy graph loading** | CLI queries | For most queries, load only the relevant subgraph from SQLite rather than the full graph. |
+| **Generator-based extraction** | Language adapters | Adapters yield nodes/edges via `Iterator`, not building full lists in memory. |
+| **Index-first queries** | SQLite | Composite indexes on `(source_id, kind)` and `(target_id, kind)` for fast edge lookups. |
+| **File-hash diffing** | Incremental updates | SHA-256 hash comparison — only re-parse changed files. |
+| **Memoized resolutions** | Phase 2 | Cache resolved FQN → node ID mappings during reference resolution. |
+
+### 9.3 Memory Management
+
+At 50K files, the expected graph size:
+- **Nodes:** ~200K-500K (modules + classes + functions + variables)
+- **Edges:** ~500K-2M
+- **Memory (networkx):** ~2-4GB for full in-memory graph
+
+For operations that don't need the full graph (most queries), we load only the relevant subgraph:
+1. Query SQLite for seed nodes
+2. BFS/DFS in SQLite to discover the relevant subgraph
+3. Load only those nodes/edges into a networkx subgraph
+4. Run the analysis on the subgraph
+
+This reduces memory for typical queries to 10-100MB.
+
+---
+
+## 10. Error Handling
+
+### 10.1 Error Categories
+
+| Scenario | Handling | User Feedback |
+|---|---|---|
+| **Parse failure** (syntax error in source) | Log warning, skip file, continue analysis | Listed in `status --errors` output. Parse error count in `analyze` summary. |
+| **Unresolvable reference** | Create edge with `confidence: "INFERRED"`, `resolved: false` | Not reported unless `--verbose`. Counted in `analyze` summary. |
+| **Circular imports** | Detected and reported during Phase 2 | Warning in `analyze` summary. Not an error (common in Python). |
+| **File too large** (>1MB source) | Parse normally | Warning: "Large file detected: path (X MB)" |
+| **Corrupted `.code-atlas/`** | `code-atlas analyze --rebuild` to wipe and rebuild | Error message with recovery instructions. |
+| **Missing tree-sitter grammar** | Clear error at `analyze` time | "Missing grammar for Java. Install: pip install tree-sitter-java" |
+| **Permission denied** (file unreadable) | Skip file, continue | Warning in summary. |
+| **Encoding error** (non-UTF-8 file) | Skip file, continue | Warning in summary. |
+| **Out of memory** | N/A for most queries (subgraph loading). Full graph load may fail at extreme scale. | Suggest using `--scope` or reducing analysis scope. |
+
+### 10.2 Graceful Degradation
+
+The tool should always produce useful results even with partial data:
+- If 10% of files fail to parse, the graph is still 90% complete and most analyses work correctly.
+- If a reference can't be resolved, the edge is still created (with `INFERRED` confidence) so analyses can still traverse it.
+- Phase 2 resolution failures don't block Phase 1 results.
+
+---
+
+## 11. Testing Strategy
+
+### 11.1 Test Layers
+
+| Layer | Type | What's Tested | Approach |
+|---|---|---|---|
+| **Core models** | Unit | `GraphNode`, `GraphEdge`, `ParsedFile` dataclasses | Assert construction, serialization, hashing |
+| **Graph model** | Unit | `CodeGraph` add/remove/query operations | Test with small hand-built graphs |
+| **Persistence** | Unit | SQLite read/write, incremental update logic | Test with temporary databases, assert round-trip |
+| **Python adapter** | Unit | Node/edge extraction from Python source | Small fixture files (10-20 lines) with specific constructs. Assert exact nodes/edges. |
+| **Java adapter** | Unit | Node/edge extraction from Java source | Small fixture files with specific constructs. Assert exact nodes/edges. |
+| **Reference resolution** | Integration | Cross-file reference resolution | Multi-file fixture projects. Assert resolved edges. |
+| **Analyzers** | Integration | Each of the 8 analyzers | Pre-built test graphs with known properties. Assert analysis results. |
+| **CLI** | Integration | Command execution, output format, error handling | `click.testing.CliRunner`. Assert exit codes, output content. |
+| **End-to-end** | E2E | Full pipeline on small real projects | Small Flask app + Spring Boot app fixtures. Run `init` → `analyze` → queries. |
+| **Performance** | Benchmark | Parsing speed, query latency, memory usage | Synthetic 10K-file graph. Assert timing bounds. |
+
+### 11.2 Test Fixture Strategy
+
+**Python fixtures** (`tests/fixtures/python/`):
+```
+simple_module.py          # Module with functions, variables
+class_hierarchy.py        # Class with inheritance
+decorators.py             # Various decorators
+imports_absolute.py       # Absolute imports
+imports_relative.py       # Relative imports  
+type_annotations.py       # Type hints
+entry_points.py           # Various entry point patterns
+multi_file_project/       # Small project with cross-file references
+  __init__.py
+  models.py
+  services.py
+  utils.py
+```
+
+**Java fixtures** (`tests/fixtures/java/`):
+```
+SimpleClass.java          # Basic class
+InheritanceExample.java   # extends, implements
+AnnotatedClass.java       # Various annotations
+ImportExamples.java       # Import patterns
+GenericClass.java         # Generic types
+InnerClasses.java         # Nested classes
+SpringController.java     # Spring framework patterns
+multi_file_project/       # Small project with cross-file references
+  com/example/
+    models/User.java
+    services/UserService.java
+    controllers/UserController.java
+```
+
+**Graph fixtures** (`tests/fixtures/graphs/`):
+Pre-built networkx graphs with known properties for testing analyzers:
+```
+linear_chain.json         # A → B → C → D (test depth traversal)
+diamond.json              # A → B,C; B,C → D (test diamond inheritance)
+cycle.json                # A → B → C → A (test cycle handling)
+disconnected.json         # Two separate components
+large_random.json         # 1000-node random graph for performance tests
+monorepo_simulation.json  # Multi-package graph simulating a monorepo
+```
+
+---
+
+## 12. Project Structure
+
+```
+code-atlas/
+├── pyproject.toml
+├── README.md
+├── LICENSE
+├── src/
+│   └── code_atlas/
+│       ├── __init__.py                  # Package version, public API
+│       ├── cli/
+│       │   ├── __init__.py
+│       │   ├── main.py                  # Click group, entry point
+│       │   ├── commands/
+│       │   │   ├── __init__.py
+│       │   │   ├── init_cmd.py          # code-atlas init
+│       │   │   ├── analyze.py           # code-atlas analyze
+│       │   │   ├── status.py            # code-atlas status
+│       │   │   ├── query.py             # code-atlas query
+│       │   │   ├── deps.py              # code-atlas deps
+│       │   │   ├── callgraph.py         # code-atlas callgraph
+│       │   │   ├── blast_radius.py      # code-atlas blast-radius
+│       │   │   ├── hierarchy.py         # code-atlas hierarchy
+│       │   │   ├── dead_code.py         # code-atlas dead-code
+│       │   │   ├── boundaries.py        # code-atlas boundaries
+│       │   │   ├── trace.py             # code-atlas trace
+│       │   │   ├── services.py          # code-atlas services
+│       │   │   ├── visualize.py         # code-atlas visualize
+│       │   │   ├── report.py            # code-atlas report
+│       │   │   └── export.py            # code-atlas export
+│       │   └── formatters.py            # Output formatting (table, json, tree)
+│       ├── core/
+│       │   ├── __init__.py
+│       │   ├── graph.py                 # CodeGraph class (networkx wrapper)
+│       │   ├── models.py                # GraphNode, GraphEdge, ParsedFile dataclasses
+│       │   ├── persistence.py           # SQLite persistence, incremental updates
+│       │   ├── config.py                # Config loading (.code-atlas/config.toml)
+│       │   └── registry.py              # Language adapter registry + discovery
+│       ├── languages/
+│       │   ├── __init__.py              # LANGUAGE_REGISTRY dict
+│       │   ├── protocol.py              # LanguageAnalyzer Protocol
+│       │   ├── python_analyzer.py       # Python tree-sitter adapter (~400-600 lines)
+│       │   └── java_analyzer.py         # Java tree-sitter adapter (~500-700 lines)
+│       ├── analyzers/
+│       │   ├── __init__.py              # Analyzer registry
+│       │   ├── base.py                  # BaseAnalyzer ABC, AnalysisResult
+│       │   ├── dependency.py            # Dependency analyzer (~150 lines)
+│       │   ├── callgraph.py             # Call graph analyzer (~150 lines)
+│       │   ├── blast_radius.py          # Blast radius analyzer (~200 lines)
+│       │   ├── type_hierarchy.py        # Type hierarchy analyzer (~150 lines)
+│       │   ├── dead_code.py             # Dead code detector (~250 lines)
+│       │   ├── boundaries.py            # Cross-module boundary analyzer (~200 lines)
+│       │   ├── flow_tracer.py           # Workflow/flow tracer (~200 lines)
+│       │   └── service_mapper.py        # Service boundary mapper (~200 lines)
+│       └── visualization/
+│           ├── __init__.py
+│           ├── html_generator.py        # D3.js HTML generation (~200 lines)
+│           └── templates/
+│               └── graph.html           # Jinja2 template with inline D3.js
+├── tests/
+│   ├── conftest.py                      # Shared fixtures, graph builders
+│   ├── fixtures/
+│   │   ├── python/                      # Python test source files
+│   │   ├── java/                        # Java test source files
+│   │   └── graphs/                      # Pre-built graph fixtures (JSON)
+│   ├── unit/
+│   │   ├── core/
+│   │   │   ├── test_graph.py
+│   │   │   ├── test_models.py
+│   │   │   └── test_persistence.py
+│   │   ├── languages/
+│   │   │   ├── test_python_analyzer.py
+│   │   │   └── test_java_analyzer.py
+│   │   └── analyzers/
+│   │       ├── test_dependency.py
+│   │       ├── test_callgraph.py
+│   │       ├── test_blast_radius.py
+│   │       ├── test_type_hierarchy.py
+│   │       ├── test_dead_code.py
+│   │       ├── test_boundaries.py
+│   │       ├── test_flow_tracer.py
+│   │       └── test_service_mapper.py
+│   ├── integration/
+│   │   ├── test_cli.py
+│   │   ├── test_end_to_end.py
+│   │   └── test_incremental.py
+│   └── benchmarks/
+│       └── test_performance.py
+└── docs/
+    ├── README.md
+    └── adding-a-language.md             # Guide for adding new language support
+```
+
+**Estimated total implementation:** ~4,000-5,500 lines of Python code (excluding tests).
+
+---
+
+## 13. Dependencies
+
+```toml
+[project]
+name = "code-atlas"
+version = "0.1.0"
+description = "CLI-based code knowledge graph for understanding large codebases"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",                  # CLI framework
+    "rich>=13.0",                  # Rich terminal output (tables, trees, progress)
+    "networkx>=3.2",               # Graph data structure + algorithms
+    "tree-sitter>=0.22",           # AST parsing engine
+    "tree-sitter-python>=0.22",    # Python grammar
+    "tree-sitter-java>=0.22",      # Java grammar
+    "jinja2>=3.1",                 # HTML template rendering for visualization
+]
+
+[project.optional-dependencies]
+community = [
+    "leidenalg>=0.10",             # Leiden community detection (for service mapper)
+    "igraph>=0.11",                # Required by leidenalg
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+code-atlas = "code_atlas.cli.main:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+```
+
+**Dependency rationale:**
+- `click`: Battle-tested CLI framework, subcommands, type validation, help generation
+- `rich`: Premium terminal output — colored tables, tree rendering, progress bars, syntax highlighting
+- `networkx`: Comprehensive graph library with BFS, DFS, shortest path, community detection
+- `tree-sitter`: Fast, incremental, error-tolerant parsing with language-specific grammars
+- `jinja2`: Clean template rendering for HTML visualization
+- `leidenalg` (optional): Superior community detection for service mapping. Falls back to networkx Louvain if not installed.
+
+---
+
+## 14. Future Extensions (Out of Scope for v1)
+
+These are explicitly not in v1 but designed to be easy to add:
+
+1. **Circular dependency detection** — Trivial to add: `networkx.find_cycle()` on the package graph.
+2. **Hotspot analysis** — Compute betweenness centrality and degree centrality on the graph.
+3. **MCP Server mode** — Wrap the analysis engine in an MCP server for AI assistant integration.
+4. **File watcher mode** — Use `watchdog` to auto-update graph on file changes.
+5. **Additional languages** — TypeScript, Go, Rust, Kotlin, C# via new adapters.
+6. **Git integration** — Blame analysis, change frequency correlation with hotspots.
+7. **Build manifest parsing** — Parse `pom.xml`, `requirements.txt`, `pyproject.toml` for external dependency tracking.
+8. **Diff-based blast radius** — Accept a git diff and compute blast radius for the entire changeset.
+9. **IDE plugins** — VS Code / IntelliJ extensions querying the Code Atlas graph.
+10. **LLM-powered queries** — Natural language questions translated to graph traversals.
+
+---
+
+## 15. Glossary
+
+| Term | Definition |
+|---|---|
+| **FQN** | Fully Qualified Name — unique identifier for a code entity (e.g., `myapp.services.UserService.create_user`) |
+| **CST** | Concrete Syntax Tree — the parse tree produced by tree-sitter |
+| **AST** | Abstract Syntax Tree — simplified version of CST (tree-sitter produces CSTs, but the term AST is used loosely) |
+| **Adapter** | A language-specific module implementing the `LanguageAnalyzer` protocol |
+| **Phase 1** | Per-file parsing and local extraction (parallelizable) |
+| **Phase 2** | Cross-file reference resolution (sequential, requires full graph) |
+| **Blast radius** | The set of entities transitively affected by a change to a given entity |
+| **Entry point** | A function that serves as a program entry (main, HTTP handler, test, CLI command) |
+| **Afferent coupling (Ca)** | Number of packages that depend on a given package |
+| **Efferent coupling (Ce)** | Number of packages a given package depends on |
+| **Instability (I)** | Ce / (Ca + Ce). 0 = maximally stable, 1 = maximally unstable |
+| **Leiden algorithm** | Community detection algorithm for finding densely connected groups in a graph |
