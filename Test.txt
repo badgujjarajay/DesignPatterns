@@ -1,1 +1,875 @@
+# claude-memory — Design Specification
+
+> **Persistent Knowledge Across Claude Code Sessions**
+>
+> A Python CLI tool that captures everything you do during Claude Code sessions,
+> compresses it into structured knowledge using AI, and injects relevant context
+> back into future sessions — so you never lose decisions, patterns, bug fixes,
+> or learnings again.
+
+---
+
+## 1. Problem Statement
+
+When working with Claude Code over time, you build up significant knowledge:
+architectural decisions, design patterns, bug fixes, solutions to tricky
+problems, coding conventions, and project-specific context. Every new session
+starts with a blank slate — Claude has no memory of what was previously decided,
+what patterns were established, or what problems were already solved.
+
+This leads to:
+- **Re-explaining** context that was already established
+- **Contradictory decisions** when Claude suggests approaches that were already rejected
+- **Lost patterns** that were carefully developed and validated
+- **Repeated debugging** of problems that were already solved
+- **Wasted tokens** re-discovering project structure and conventions
+
+claude-memory solves this by automatically capturing session activity, compressing
+it into structured knowledge entries, and injecting the most relevant context
+into new sessions.
+
+---
+
+## 2. Target Platform
+
+- **Claude Code only** — integrates via Claude Code's hook system
+- **No MCP** — pure CLI tool, no Model Context Protocol server
+- **Local only** — all data stays on the user's machine
+
+---
+
+## 3. System Architecture
+
+claude-memory is a **Python CLI tool** with no background services, no daemons,
+and no process managers. Every operation is a standalone CLI invocation triggered
+either by Claude Code hooks or by the user directly.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Claude Code Session                     │
+│                                                              │
+│  ┌──────────┐    ┌──────────────┐    ┌──────────────────┐   │
+│  │ Session   │    │ PreToolUse / │    │ Session End      │   │
+│  │ Start     │    │ PostToolUse  │    │                  │   │
+│  │ Hook      │    │ Hook         │    │ Hook             │   │
+│  └─────┬─────┘    └──────┬───────┘    └────────┬─────────┘   │
+│        │                │                     │             │
+└────────┼────────────────┼─────────────────────┼─────────────┘
+         │                │                     │
+         ▼                ▼                     ▼
+   claude-memory    claude-memory         claude-memory
+     inject           capture               compress
+         │                │                     │
+         │                ▼                     │
+         │        ┌──────────────┐              │
+         │        │   SQLite DB  │◄─────────────┘
+         └───────►│  (~/.claude- │
+                  │   memory/)   │
+                  └──────────────┘
+```
+
+### Four Core Operations
+
+1. **`inject`** — Called at session start via `SessionStart` hook. Queries SQLite
+   for relevant context (recent workspace knowledge, global patterns, last session
+   summary), formats it as structured markdown, and outputs to stdout for Claude
+   Code to consume as system prompt context.
+
+2. **`capture`** — Called on every tool call via `PreToolUse`/`PostToolUse` hooks.
+   Receives tool name and input/output via stdin, applies privacy filtering, and
+   stores a raw observation in SQLite.
+
+3. **`compress`** — Called at session end via `SessionEnd` hook. Loads all
+   non-private observations for the session, groups them by file cluster, sends
+   each group to Claude Code CLI for AI-powered knowledge extraction, and stores
+   the resulting structured knowledge entries. Also generates an end-of-session
+   summary.
+
+4. **`remember`** — User-invoked command. Explicitly saves a piece of knowledge
+   with a specified type and scope. Bypasses the capture→compress pipeline.
+
+### Data Flow
+
+```
+Raw tool calls ──► capture ──► observations table (raw, ephemeral)
+                                      │
+                                      ▼
+                               compress (AI) ──► knowledge table (structured, permanent)
+                                      │
+                                      ▼
+                               session_summaries table
+                                      │
+                                      ▼
+Knowledge + Summaries ──► inject ──► context in next session
+```
+
+---
+
+## 4. Database Schema
+
+All data lives in a single SQLite database at `~/.claude-memory/claude-memory.db`
+with WAL (Write-Ahead Logging) mode enabled for safe concurrent read/write access.
+
+### 4.1 `sessions` Table
+
+Tracks each Claude Code session.
+
+| Column              | Type     | Constraints       | Description                              |
+|---------------------|----------|-------------------|------------------------------------------|
+| `id`                | TEXT     | PRIMARY KEY       | UUID                                     |
+| `claude_session_id` | TEXT     | UNIQUE, NOT NULL  | Claude Code's own session identifier     |
+| `workspace`         | TEXT     | NOT NULL          | Workspace directory path                 |
+| `workspace_name`    | TEXT     | NOT NULL          | Extracted workspace name (basename)      |
+| `initial_prompt`    | TEXT     |                   | The first user prompt of the session     |
+| `status`            | TEXT     | NOT NULL          | `active`, `completed`, `error`, `compression_pending` |
+| `observation_count` | INTEGER  | DEFAULT 0         | Running count of tool calls captured     |
+| `created_at`        | DATETIME | NOT NULL          | Session start time (ISO 8601)            |
+| `completed_at`      | DATETIME |                   | Session end time (ISO 8601)              |
+
+**Indexes:**
+- `idx_sessions_workspace` on `(workspace)`
+- `idx_sessions_status` on `(status)`
+- `idx_sessions_created` on `(created_at DESC)`
+
+### 4.2 `observations` Table
+
+Raw tool-call captures (pre-compression). Ephemeral — designed to be pruned
+after compression.
+
+| Column           | Type     | Constraints       | Description                                  |
+|------------------|----------|-------------------|----------------------------------------------|
+| `id`             | TEXT     | PRIMARY KEY       | UUID                                         |
+| `session_id`     | TEXT     | FK → sessions.id  | Parent session                               |
+| `tool_name`      | TEXT     | NOT NULL          | e.g., `write_to_file`, `run_command`, `grep` |
+| `hook_type`      | TEXT     | NOT NULL          | `pre` or `post`                              |
+| `tool_input`     | TEXT     |                   | Truncated input payload (JSON, ≤2000 chars)  |
+| `tool_output`    | TEXT     |                   | Truncated output payload (JSON, ≤4000 chars) |
+| `files_read`     | TEXT     |                   | JSON array of files read                     |
+| `files_modified`  | TEXT     |                   | JSON array of files written/modified         |
+| `is_private`     | BOOLEAN  | DEFAULT false     | True if within `<private>` scope or matched by privacy rule |
+| `created_at`     | DATETIME | NOT NULL          | When the tool call occurred                  |
+
+**Indexes:**
+- `idx_observations_session` on `(session_id)`
+- `idx_observations_private` on `(is_private)`
+
+### 4.3 `knowledge` Table
+
+Compressed, structured knowledge entries (post-compression). Permanent storage.
+
+| Column           | Type     | Constraints       | Description                                  |
+|------------------|----------|-------------------|----------------------------------------------|
+| `id`             | TEXT     | PRIMARY KEY       | UUID                                         |
+| `session_id`     | TEXT     | FK → sessions.id, NULLABLE | Source session (NULL for manual `remember` entries) |
+| `workspace`      | TEXT     |                   | Workspace path (NULL for global scope)       |
+| `scope`          | TEXT     | NOT NULL          | `workspace` or `global`                      |
+| `type`           | TEXT     | NOT NULL          | See Knowledge Types below                    |
+| `priority`       | INTEGER  | NOT NULL          | 1–5, derived from type hierarchy             |
+| `title`          | TEXT     | NOT NULL          | One-line summary                             |
+| `narrative`      | TEXT     | NOT NULL          | 2–3 sentence natural language description    |
+| `facts`          | TEXT     |                   | JSON array of concrete, atomic facts         |
+| `concepts`       | TEXT     |                   | JSON array of concept tags                   |
+| `files_involved` | TEXT     |                   | JSON array of file paths                     |
+| `created_at`     | DATETIME | NOT NULL          | When the knowledge was created               |
+
+**Indexes:**
+- `idx_knowledge_workspace` on `(workspace)`
+- `idx_knowledge_scope` on `(scope)`
+- `idx_knowledge_type` on `(type)`
+- `idx_knowledge_priority` on `(priority DESC, created_at DESC)`
+- `idx_knowledge_created` on `(created_at DESC)`
+
+#### Knowledge Types & Priority Hierarchy
+
+| Priority | Type        | Description                                     |
+|----------|-------------|-------------------------------------------------|
+| 5        | `decision`  | Architectural choices, "we chose X over Y because..." |
+| 4        | `pattern`   | Reusable approaches, coding patterns, conventions |
+| 3        | `bugfix`    | Bug fixes with root cause analysis               |
+| 3        | `solution`  | Solutions to tricky problems                     |
+| 2        | `feature`   | New functionality built                          |
+| 2        | `refactor`  | Code restructuring                               |
+| 1        | `discovery` | General learnings, context, observations         |
+
+### 4.4 `session_summaries` Table
+
+AI-generated end-of-session summaries.
+
+| Column         | Type     | Constraints       | Description                    |
+|----------------|----------|-------------------|--------------------------------|
+| `id`           | TEXT     | PRIMARY KEY       | UUID                           |
+| `session_id`   | TEXT     | FK → sessions.id  | Parent session                 |
+| `workspace`    | TEXT     | NOT NULL          | Workspace path                 |
+| `request`      | TEXT     | NOT NULL          | What was the user trying to do |
+| `investigated` | TEXT     | NOT NULL          | What was explored/researched   |
+| `learned`      | TEXT     | NOT NULL          | Key learnings and discoveries  |
+| `completed`    | TEXT     | NOT NULL          | What was accomplished          |
+| `next_steps`   | TEXT     |                   | Suggested follow-ups           |
+| `created_at`   | DATETIME | NOT NULL          | When summary was generated     |
+
+**Indexes:**
+- `idx_summaries_workspace` on `(workspace)`
+- `idx_summaries_session` on `(session_id)`
+- `idx_summaries_created` on `(created_at DESC)`
+
+### 4.5 `privacy_rules` Table
+
+User-defined exclusion rules.
+
+| Column       | Type     | Constraints  | Description                            |
+|--------------|----------|--------------|----------------------------------------|
+| `id`         | TEXT     | PRIMARY KEY  | UUID                                   |
+| `rule_type`  | TEXT     | NOT NULL     | `file_pattern`, `directory`, `keyword` |
+| `pattern`    | TEXT     | NOT NULL     | Glob pattern, path, or keyword         |
+| `created_at` | DATETIME | NOT NULL     | When rule was added                    |
+
+### 4.6 FTS5 Virtual Tables
+
+```sql
+-- Full-text search over knowledge entries
+CREATE VIRTUAL TABLE knowledge_fts USING fts5(
+    title, narrative, facts, concepts,
+    content='knowledge', content_rowid='rowid'
+);
+
+-- Full-text search over session summaries
+CREATE VIRTUAL TABLE summaries_fts USING fts5(
+    request, investigated, learned, completed, next_steps,
+    content='session_summaries', content_rowid='rowid'
+);
+```
+
+FTS5 indexes are maintained via triggers that fire on INSERT, UPDATE, and DELETE
+to the parent tables.
+
+### 4.7 Schema Versioning
+
+A `schema_version` table tracks the current schema version:
+
+| Column    | Type    | Description                  |
+|-----------|---------|------------------------------|
+| `version` | INTEGER | Current schema version number |
+
+Migrations are applied sequentially. Each migration is a Python function in
+`db/migrations.py` that receives a database connection.
+
+---
+
+## 5. CLI Interface
+
+The tool is installed as `claude-memory` (with short alias `cmem`) and uses
+Click for command parsing.
+
+### 5.1 Core Lifecycle Commands (Called by Hooks)
+
+```bash
+# Session start — inject relevant context to stdout
+claude-memory inject \
+    --workspace /path/to/project \
+    --session-id <claude-session-id>
+
+# Tool call — capture raw observation from stdin
+echo '{"input": {...}, "output": {...}}' | \
+claude-memory capture \
+    --session-id <claude-session-id> \
+    --tool <tool-name> \
+    --hook pre|post
+
+# Session end — compress observations into knowledge
+claude-memory compress --session-id <claude-session-id>
+```
+
+### 5.2 Manual Commands (User-Invoked)
+
+```bash
+# Explicitly save a piece of knowledge
+claude-memory remember "We chose PostgreSQL over MongoDB because our data is relational" \
+    --type decision \
+    --scope global
+
+claude-memory remember "Use retry decorator for flaky API calls" \
+    --type pattern \
+    --scope workspace
+
+# Search across all memories
+claude-memory search "authentication pattern"
+claude-memory search "how did we fix the race condition" --workspace ./
+claude-memory search "error handling" --type decision --scope global
+
+# Browse recent knowledge entries
+claude-memory log                                    # last 20 entries
+claude-memory log --workspace ./ --limit 50          # workspace-specific
+claude-memory log --type decision                    # filter by type
+claude-memory log --type pattern --scope global      # global patterns only
+
+# View a specific session's knowledge
+claude-memory session <session-id>
+claude-memory session --last                         # most recent session
+
+# Launch setup
+claude-memory init                                   # create DB + config
+claude-memory install                                # configure Claude Code hooks
+claude-memory uninstall                              # remove hooks
+
+# Privacy rule management
+claude-memory privacy add --file-pattern "*.env"
+claude-memory privacy add --directory "/secrets"
+claude-memory privacy add --keyword "API_KEY"
+claude-memory privacy list
+claude-memory privacy remove <rule-id>
+
+# Database maintenance
+claude-memory stats                                  # storage stats, entry counts
+claude-memory export --format json                   # export all knowledge
+claude-memory prune --older-than 90d                 # remove old raw observations
+claude-memory prune --keep-knowledge                 # prune observations, keep knowledge
+claude-memory compress --retry                       # retry failed compressions
+claude-memory repair                                 # integrity check + rebuild
+claude-memory migrate-workspace --from /old --to /new # update workspace paths
+```
+
+### 5.3 Global Options
+
+All commands support:
+- `--verbose` / `-v` — Debug output to stderr
+- `--config <path>` — Override config file location
+- `--db <path>` — Override database file location
+
+### 5.4 Output Contract
+
+- **stdout** is reserved for data consumed by Claude Code (especially `inject` output)
+- **stderr** is used for log messages, errors, and progress indicators
+- Hook commands **always exit 0** even on internal errors, to never block Claude Code
+- `--format json` flag available on `search`, `log`, `session`, `stats` for machine-readable output
+
+---
+
+## 6. Claude Code Hook Configuration
+
+### 6.1 `claude-memory install` Behavior
+
+The `install` command detects Claude Code's settings location and writes hook
+configuration. It supports both workspace-level (`.claude/settings.json`) and
+user-level (`~/.claude/settings.json`) installation.
+
+### 6.2 Hook Configuration
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "command": "claude-memory capture --session-id $CLAUDE_SESSION_ID --tool $TOOL_NAME --hook pre"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "command": "claude-memory capture --session-id $CLAUDE_SESSION_ID --tool $TOOL_NAME --hook post"
+      }
+    ],
+    "SessionStart": [
+      {
+        "command": "claude-memory inject --workspace $PWD --session-id $CLAUDE_SESSION_ID"
+      }
+    ],
+    "SessionEnd": [
+      {
+        "command": "claude-memory compress --session-id $CLAUDE_SESSION_ID"
+      }
+    ]
+  }
+}
+```
+
+### 6.3 Hook Environment Variables
+
+The hooks rely on Claude Code providing these environment variables:
+- `$CLAUDE_SESSION_ID` — Unique session identifier
+- `$TOOL_NAME` — Name of the tool being called (for `PreToolUse`/`PostToolUse`)
+- `$PWD` — Current working directory (workspace path)
+
+Tool input/output is passed via stdin as JSON for `PreToolUse`/`PostToolUse` hooks.
+
+---
+
+## 7. Context Injection Strategy
+
+### 7.1 What Gets Injected
+
+At session start, `inject` constructs a context block from four sources:
+
+1. **Recent workspace knowledge** — Last N knowledge entries for this workspace,
+   ordered by `priority DESC, created_at DESC`. Default: 10 entries.
+2. **Last session summary** — The most recent session summary for this workspace.
+3. **Global high-priority knowledge** — Top M global-scope entries with
+   `priority >= 4` (decisions & patterns only). Default: 5 entries.
+4. **Pending next steps** — Any `next_steps` from the last session summary that
+   haven't been addressed yet.
+
+### 7.2 Token Budget
+
+Total injected context is capped at a configurable token budget (default: 4000
+tokens). Token count is estimated using a simple heuristic: `len(text) / 4`.
+
+If the assembled context exceeds the budget:
+1. Lower-priority entries are dropped first
+2. Within the same priority, older entries are dropped first
+3. The session summary is always kept (it's the highest-signal, most compact item)
+4. At least one entry from each source is kept if possible
+
+### 7.3 Output Format
+
+The injected context is formatted as structured markdown:
+
+```markdown
+## claude-memory: Session Context
+
+### Last Session Summary
+**Request:** [what was asked]
+**Completed:** [what was done]
+**Next Steps:** [what to do next]
+
+### Recent Workspace Knowledge
+1. **[DECISION]** Title of decision — narrative
+2. **[PATTERN]** Title of pattern — narrative
+3. **[BUGFIX]** Title of bugfix — narrative
+
+### Global Patterns & Decisions
+1. **[PATTERN]** Title — narrative
+2. **[DECISION]** Title — narrative
+```
+
+---
+
+## 8. AI Compression Pipeline
+
+### 8.1 Capture Phase (During Session)
+
+Every tool call captured by hooks is stored as a raw observation with these
+processing steps:
+
+1. **Input truncation**: Tool inputs > 2000 chars are truncated with `[truncated]`
+2. **Output truncation**: Tool outputs > 4000 chars are truncated
+3. **File extraction**: File paths are extracted from tool inputs/outputs and
+   stored in `files_read` / `files_modified`
+4. **Privacy filtering**: Content is checked against privacy rules and inline
+   `<private>` tags. Matching observations are marked `is_private=true`.
+5. **Deduplication**: Repeated reads of the same file within a session are
+   collapsed (only first read stored)
+6. **Tool filtering**: Low-signal tools listed in `config.toml`'s `ignore_tools`
+   are skipped entirely
+
+### 8.2 Compression Phase (End of Session)
+
+When `claude-memory compress` runs:
+
+1. **Load** all non-private observations for the session
+2. **Skip** if fewer than `min_observations` (default: 3) observations exist
+3. **Group** observations by logical activity using file-cluster heuristic:
+   observations touching the same files within a time window are grouped together
+4. **Filter** out low-signal observations (simple file reads, `ls` commands, etc.)
+5. **Construct compression prompt** for each group
+6. **Send to Claude Code CLI** via subprocess:
+   ```bash
+   echo "<prompt>" | claude -p --output-format json
+   ```
+7. **Parse JSON response** into Knowledge entries
+8. **Insert** knowledge entries with appropriate priority scores
+9. **Generate session summary** using a separate prompt
+10. **Sync FTS5 indexes** after all inserts
+11. **Update session status** to `completed`
+
+### 8.3 Knowledge Extraction Prompt
+
+```
+You are a knowledge extraction system. Given these raw tool observations from
+a coding session, extract structured knowledge entries.
+
+For each distinct piece of knowledge, output a JSON array of objects with:
+- type: one of "decision", "pattern", "bugfix", "solution", "feature",
+  "discovery", "refactor"
+- scope: "workspace" if specific to this codebase, "global" if a general
+  technique/pattern applicable anywhere
+- title: one-line summary (imperative mood, e.g., "Use retry decorator for
+  flaky API calls")
+- narrative: 2-3 sentence natural language description of what happened and why
+- facts: array of concrete, atomic facts (e.g., ["SQLite FTS5 requires
+  content= for external content tables"])
+- concepts: array of concept tags (e.g., ["error-handling", "retry-pattern"])
+- files_involved: array of file paths that were central to this knowledge
+
+Prioritize extracting:
+1. Decisions and WHY they were made (highest value)
+2. Patterns that could be reused
+3. Bug fixes and their root causes
+4. What was built or changed
+
+Output valid JSON only. No markdown fencing. No commentary.
+
+Raw observations:
+{observations_json}
+```
+
+### 8.4 Session Summary Prompt
+
+```
+Summarize this coding session. Output a JSON object with these fields:
+- request: What was the user trying to accomplish? (1-2 sentences)
+- investigated: What was explored or researched? (1-2 sentences)
+- learned: Key learnings and discoveries (1-3 bullet points)
+- completed: What was accomplished? (1-2 sentences)
+- next_steps: What should be done next? (1-3 bullet points, or null if none)
+
+Output valid JSON only. No markdown fencing. No commentary.
+
+Session observations:
+{observations_json}
+```
+
+### 8.5 Batching Strategy
+
+For sessions with many observations:
+- Observations are batched into groups of ~30
+- Each batch is compressed independently
+- Batching is done by file-cluster first, then by time proximity
+- Each compression call produces its own set of knowledge entries
+- The session summary prompt receives a representative sample (first 10 + last 10
+  observations) if total exceeds 50
+
+---
+
+## 9. Privacy & Security System
+
+### 9.1 Three Layers of Protection
+
+**Layer 1: Inline `<private>` Tags**
+
+Anything wrapped in `<private>` tags during a Claude Code session is excluded:
+- Observations are stored with `is_private=true`
+- Private observations are never sent to compression
+- Private observations are never returned by `inject` or `search`
+- They remain in the DB for audit but are invisible to retrieval
+
+**Layer 2: Persistent Privacy Rules**
+
+Rules stored in `privacy_rules` table, applied automatically:
+
+```bash
+claude-memory privacy add --file-pattern "*.env"      # file glob patterns
+claude-memory privacy add --directory "/secrets"       # directory blackholes
+claude-memory privacy add --keyword "API_KEY"          # content keyword matching
+```
+
+Matching logic during capture:
+1. Check `files_read`/`files_modified` against file pattern and directory rules
+2. Check `tool_input`/`tool_output` against keyword rules
+3. Any match → `is_private=true`
+
+**Layer 3: Config-Level Exclusions**
+
+Baseline patterns in `config.toml`:
+
+```toml
+[privacy]
+exclude_patterns = ["*.env", "*.pem", "*.key", "*.secret"]
+```
+
+### 9.2 Pre-Compression Sanitization
+
+Before sending observations to Claude Code CLI:
+1. All `is_private=true` observations are filtered out
+2. Keyword-matched strings are replaced with `[REDACTED]`
+3. File paths matching privacy patterns are replaced with `[PRIVATE_FILE]`
+
+### 9.3 Data Locality
+
+- All storage is local SQLite at `~/.claude-memory/`
+- No data is sent to any external service
+- AI compression uses Claude Code CLI which runs through the user's existing
+  Anthropic authentication — no additional API keys needed
+- No telemetry, no analytics, no phone-home
+
+---
+
+## 10. Error Handling
+
+| Scenario                                | Behavior                                                                                             |
+|-----------------------------------------|------------------------------------------------------------------------------------------------------|
+| Claude Code CLI unavailable at compress | Observations preserved, session status set to `compression_pending`. `compress --retry` re-attempts. |
+| Claude Code CLI returns bad JSON        | Raw prompt + response logged to `~/.claude-memory/errors/`. Observations preserved. Warning on stderr. |
+| Database locked (concurrent access)     | WAL mode handles concurrent reads. Writes retry with exponential backoff (3 attempts: 100/200/400ms). |
+| Hook fails                              | Hooks always exit 0. Internal errors are logged to `~/.claude-memory/errors/`, never block Claude Code. |
+| Disk full                               | Graceful error message to stderr. `stats` command shows DB size for diagnosis.                       |
+| Corrupted database                      | `repair` command runs integrity check + rebuild. If unrecoverable, backs up and creates fresh DB.    |
+| Schema version mismatch                 | Auto-applies pending migrations on first access. Backward-compatible.                                 |
+
+---
+
+## 11. Edge Cases
+
+| Case                              | Handling                                                                                        |
+|-----------------------------------|-------------------------------------------------------------------------------------------------|
+| Very short session (< 3 obs)      | Skip compression (configurable). Still record session metadata.                                 |
+| Very long session (100s of calls)  | Batch observations into chunks of ~30 for compression.                                          |
+| Same workspace, different branches | Workspace = directory path. Branch-level scoping not tracked.                                   |
+| Workspace renamed/moved           | Old knowledge remains. `migrate-workspace --from /old --to /new` command updates paths.         |
+| Multiple concurrent sessions      | Each session has unique ID. WAL mode ensures safe concurrent writes.                            |
+| No internet / offline             | Capture and inject work fully offline. Compress queues for retry.                               |
+
+---
+
+## 12. Performance Requirements
+
+| Operation   | Target Latency | Notes                                          |
+|-------------|----------------|-------------------------------------------------|
+| `capture`   | < 100ms        | Single SQLite INSERT. Must never slow Claude Code. |
+| `inject`    | < 50ms         | One SELECT with LIMIT + ORDER BY.              |
+| `compress`  | 5–30 seconds   | AI call. Runs at session end, user isn't waiting. |
+| `search`    | < 200ms        | FTS5 query + result formatting.                |
+| DB size     | < 500MB        | For years of typical use with truncation limits. |
+
+---
+
+## 13. Configuration
+
+Configuration lives at `~/.claude-memory/config.toml`:
+
+```toml
+[general]
+db_path = "~/.claude-memory/claude-memory.db"
+token_budget = 4000
+log_level = "info"                          # debug, info, warn, error
+
+[capture]
+input_max_chars = 2000
+output_max_chars = 4000
+ignore_tools = ["grep", "glob"]             # low-signal tools to skip
+deduplicate_reads = true
+
+[compression]
+batch_by_files = true
+min_observations = 3
+auto_compress = true                        # set false for manual control
+
+[inject]
+workspace_entries = 10
+global_entries = 5
+min_priority = 1
+include_last_summary = true
+
+[privacy]
+exclude_patterns = ["*.env", "*.pem", "*.key", "*.secret"]
+```
+
+---
+
+## 14. File Layout
+
+### 14.1 On-Disk Structure
+
+```
+~/.claude-memory/
+├── claude-memory.db              # SQLite database (WAL mode)
+├── claude-memory.db-wal          # WAL file (auto-managed)
+├── claude-memory.db-shm          # Shared memory (auto-managed)
+├── config.toml                   # User configuration
+└── errors/                       # Failed compression logs
+    └── 2026-07-05_<session-id>.json
+```
+
+### 14.2 Python Package Structure
+
+```
+claude-memory/
+├── pyproject.toml
+├── README.md
+├── src/
+│   └── claude_memory/
+│       ├── __init__.py
+│       ├── __main__.py                 # python -m claude_memory support
+│       │
+│       ├── cli/                        # CLI layer — one file per command group
+│       │   ├── __init__.py             # Click group registration
+│       │   ├── main.py                 # Top-level CLI group + global options
+│       │   ├── capture.py              # capture command
+│       │   ├── compress.py             # compress command
+│       │   ├── inject.py               # inject command
+│       │   ├── search.py               # search, log commands
+│       │   ├── remember.py             # remember command (manual save)
+│       │   ├── session.py              # session browsing commands
+│       │   ├── privacy.py              # privacy rule management commands
+│       │   ├── install.py              # install/uninstall hooks
+│       │   ├── maintenance.py          # stats, export, prune, init, repair
+│       │   └── formatters.py           # Output formatting (table, json, markdown)
+│       │
+│       ├── core/                       # Business logic — no CLI or DB awareness
+│       │   ├── __init__.py
+│       │   ├── capture.py              # Observation capture logic + filtering
+│       │   ├── compress.py             # Compression orchestration + prompt building
+│       │   ├── inject.py               # Context selection + ranking + budget
+│       │   ├── search.py               # Search query building + result ranking
+│       │   ├── privacy.py              # Privacy rule matching engine
+│       │   └── hooks.py                # Hook config generation logic
+│       │
+│       ├── models/                     # Data classes — pure data, no logic
+│       │   ├── __init__.py
+│       │   ├── session.py              # Session dataclass
+│       │   ├── observation.py          # Observation dataclass
+│       │   ├── knowledge.py            # Knowledge entry dataclass
+│       │   ├── summary.py              # Session summary dataclass
+│       │   ├── privacy.py              # Privacy rule dataclass
+│       │   └── enums.py                # KnowledgeType, Scope, Priority, Status enums
+│       │
+│       ├── db/                         # Database layer — swappable
+│       │   ├── __init__.py
+│       │   ├── connection.py           # DB connection manager (WAL, pragmas)
+│       │   ├── schema.py               # Table definitions + FTS5 setup
+│       │   ├── migrations.py           # Schema versioning + migration runner
+│       │   ├── repositories/           # One repository per aggregate
+│       │   │   ├── __init__.py
+│       │   │   ├── session_repo.py     # CRUD for sessions
+│       │   │   ├── observation_repo.py # CRUD for observations
+│       │   │   ├── knowledge_repo.py   # CRUD + FTS queries for knowledge
+│       │   │   ├── summary_repo.py     # CRUD for session summaries
+│       │   │   └── privacy_repo.py     # CRUD for privacy rules
+│       │   └── queries/                # Complex queries isolated as SQL
+│       │       ├── __init__.py
+│       │       ├── search_queries.py   # FTS5 search queries
+│       │       └── inject_queries.py   # Context injection ranking queries
+│       │
+│       ├── ai/                         # AI integration layer — swappable provider
+│       │   ├── __init__.py
+│       │   ├── base.py                 # Abstract base class for AI providers
+│       │   ├── claude_code.py          # Claude Code CLI provider (subprocess)
+│       │   ├── prompts/                # Prompt templates isolated from logic
+│       │   │   ├── __init__.py
+│       │   │   ├── compression.py      # Knowledge extraction prompt
+│       │   │   ├── summarization.py    # Session summary prompt
+│       │   │   └── templates.py        # Shared prompt fragments
+│       │   └── parsers/                # Response parsing
+│       │       ├── __init__.py
+│       │       ├── knowledge_parser.py # Parse AI output → Knowledge entries
+│       │       └── summary_parser.py   # Parse AI output → SessionSummary
+│       │
+│       ├── config/                     # Configuration management
+│       │   ├── __init__.py
+│       │   ├── loader.py               # TOML loading + defaults + validation
+│       │   ├── defaults.py             # Default config values
+│       │   └── paths.py                # Path resolution (~/.claude-memory, etc.)
+│       │
+│       └── utils/                      # Shared utilities
+│           ├── __init__.py
+│           ├── text.py                 # Truncation, token estimation
+│           ├── files.py                # File path extraction from tool payloads
+│           ├── time.py                 # Timestamp formatting, relative time
+│           └── logging.py             # Structured logging setup
+│
+└── tests/
+    ├── conftest.py                     # Shared fixtures (in-memory DB, mock AI)
+    ├── cli/
+    │   ├── test_capture_cmd.py
+    │   ├── test_compress_cmd.py
+    │   ├── test_inject_cmd.py
+    │   └── test_search_cmd.py
+    ├── core/
+    │   ├── test_capture.py
+    │   ├── test_compress.py
+    │   ├── test_inject.py
+    │   ├── test_search.py
+    │   └── test_privacy.py
+    ├── db/
+    │   ├── test_schema.py
+    │   ├── test_migrations.py
+    │   └── test_repositories.py
+    └── ai/
+        ├── test_prompts.py
+        └── test_parsers.py
+```
+
+### 14.3 Design Principles
+
+| Principle                   | How It's Applied                                                                                          |
+|-----------------------------|-----------------------------------------------------------------------------------------------------------|
+| Separation of concerns      | `cli/` → Click, `core/` → business rules, `db/` → SQL, `ai/` → LLM calls. No cross-boundary leaks.     |
+| Repository pattern           | Each entity gets its own repository. Adding an entity = new model + new repo.                             |
+| Swappable AI provider        | `ai/base.py` defines abstract interface. Adding a provider = implement the interface in a new file.       |
+| Prompts as data              | Templates in `ai/prompts/`, separate from orchestration. Iterate on prompts without touching logic.       |
+| Isolated queries             | Complex SQL in `db/queries/`, not scattered through business logic.                                       |
+| Testable at every layer      | Core: no CLI/DB. DB: in-memory SQLite. AI: mock providers.                                                |
+
+### 14.4 Extension Points
+
+| Want to add...            | Where to add it                                              |
+|---------------------------|--------------------------------------------------------------|
+| New knowledge type         | `models/enums.py` + `ai/prompts/compression.py`             |
+| New AI provider            | Implement `ai/base.py` interface in new file                |
+| New CLI command            | New file in `cli/`, register in `cli/__init__.py`           |
+| New storage backend        | Implement repository interfaces for new backend             |
+| Web dashboard (future)     | New top-level `dashboard/` package importing `db/` + `models/` |
+
+---
+
+## 15. Dependencies
+
+### Runtime
+- **click** — CLI framework
+- **tomli** — TOML parsing (stdlib `tomllib` on Python 3.11+)
+
+### Development
+- **pytest** — Testing framework
+- **pytest-cov** — Coverage reporting
+
+### Not Dependencies
+- SQLite — Python stdlib (`sqlite3`)
+- JSON — Python stdlib
+- subprocess — Python stdlib (for Claude Code CLI calls)
+- uuid — Python stdlib
+- pathlib — Python stdlib
+- datetime — Python stdlib
+
+**Minimum Python version: 3.10** (for `match` statements, modern type hints)
+
+---
+
+## 16. Installation & First Run
+
+```bash
+# Install from PyPI (future) or local
+pip install claude-memory
+# or
+pip install -e .
+
+# Initialize database and config
+claude-memory init
+# Creates ~/.claude-memory/ directory
+# Creates claude-memory.db with schema
+# Creates default config.toml
+
+# Install hooks into Claude Code (workspace-level)
+cd /path/to/your/workspace
+claude-memory install
+# Writes hook config to .claude/settings.json
+
+# Verify installation
+claude-memory stats
+# Shows: 0 sessions, 0 observations, 0 knowledge entries, DB size
+
+# Start a Claude Code session — memory capture begins automatically
+claude
+```
+
+---
+
+## 17. Scope Boundaries — What's NOT Included
+
+- **Web dashboard** — deferred to future version
+- **MCP server** — not needed, CLI-only integration
+- **Vector embeddings / semantic search** — FTS5 keyword search is sufficient for v1
+- **Multi-user / team sharing** — local-only, single user
+- **Branch-level scoping** — workspace = directory path, no git branch awareness
+- **Real-time streaming UI** — no daemon, no WebSocket
+- **Cloud sync / backup** — user can back up `~/.claude-memory/` manually
+- **Automatic CLAUDE.md generation** — not in scope (complementary, not overlapping)
 
