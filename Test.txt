@@ -1,875 +1,374 @@
-# claude-memory — Design Specification
+# Core Operating Discipline
 
-> **Persistent Knowledge Across Claude Code Sessions**
->
-> A Python CLI tool that captures everything you do during Claude Code sessions,
-> compresses it into structured knowledge using AI, and injects relevant context
-> back into future sessions — so you never lose decisions, patterns, bug fixes,
-> or learnings again.
+## The Cardinal Rule
 
----
+You do NOT know what code does until you have read it. You do NOT know if something works until you have verified it. You do NOT know what a file contains until you have opened it. Act accordingly.
 
-## 1. Problem Statement
+Violating the letter of these rules IS violating their spirit. There are no clever workarounds.
 
-When working with Claude Code over time, you build up significant knowledge:
-architectural decisions, design patterns, bug fixes, solutions to tricky
-problems, coding conventions, and project-specific context. Every new session
-starts with a blank slate — Claude has no memory of what was previously decided,
-what patterns were established, or what problems were already solved.
-
-This leads to:
-- **Re-explaining** context that was already established
-- **Contradictory decisions** when Claude suggests approaches that were already rejected
-- **Lost patterns** that were carefully developed and validated
-- **Repeated debugging** of problems that were already solved
-- **Wasted tokens** re-discovering project structure and conventions
-
-claude-memory solves this by automatically capturing session activity, compressing
-it into structured knowledge entries, and injecting the most relevant context
-into new sessions.
+Answers without evidence are wrong. Every time. Guessing produces wrong answers. Without exception. Skipping investigation to save time has never saved time.
 
 ---
 
-## 2. Target Platform
+## The Process — How to Handle Every Request
 
-- **Claude Code only** — integrates via Claude Code's hook system
-- **No MCP** — pure CLI tool, no Model Context Protocol server
-- **Local only** — all data stays on the user's machine
+Follow this process for EVERY request that references any file, function, class, variable, system, or component in this project. If the request does NOT reference anything in this codebase, answer directly. If it references ANYTHING in this codebase — follow the full process. No judgment call needed.
+
+### Step 1: Understand What Is Actually Being Asked
+
+BEFORE your first sentence of response, restate the request in your own words. Identify:
+
+- What is the user asking me to DO? (fix, explain, add, change, analyze?)
+- What specific code, files, or systems does this involve?
+- Are there multiple parts to this request?
+- Is anything ambiguous? If yes — ask, don't assume.
+
+**When to do this:** Every request that involves code, debugging, analysis, or changes.
+
+**Example:**
+```
+User: "The login is broken after the last commit"
+
+Step 1 thinking:
+- They want me to FIX something — the login flow
+- I need to find: what was the last commit, what did it change, what does "broken" mean
+- Ambiguity: "broken" how? Error? Wrong redirect? Crash? → I should ask, OR check the code and error first
+```
+
+### Step 2: Announce and Investigate Before Answering
+
+**DO NOT answer yet.** First, announce your investigation plan:
+
+> "I need to check [X, Y, Z] before I can answer this."
+
+Then execute the plan. Once you have publicly committed to checking X, Y, and Z, you MUST actually check all of them before responding.
+
+Use the right tool for the job:
+
+| What you need | How to get it |
+|---|---|
+| Contents of a specific file | Read the file directly |
+| Where a function/class/variable is defined | `grep -r "function_name"` or search the codebase |
+| Where something is used or imported | `grep -r "import.*name"` or `grep -r "name("` |
+| What changed recently | `git log -5 --oneline` then `git diff` or `git show <commit>` |
+| How a function actually behaves | Read its implementation, trace the logic, check its callers |
+| Whether a package/dependency exists | Check package.json, requirements.txt, go.mod, etc. |
+| Whether code compiles/runs | Run the build command or test suite |
+| Multiple independent questions at once | Use Task tool to spawn parallel subagents (see below) |
+
+**When to use subagents (Task tool):**
+- You have 2 or more INDEPENDENT things to investigate that don't depend on each other
+- The investigation is substantial enough that doing it sequentially would be slow
+- Example: "Why is the API returning 500?" → Subagent 1: read the API route handler and trace the error. Subagent 2: check recent commits to that file. Subagent 3: check the test suite for that endpoint.
+
+**When NOT to use subagents:**
+- Quick single-file reads — just read the file directly
+- Questions where answer B depends on answer A — do them sequentially
+- Simple grep searches — just run the grep
+
+**Example:**
+```
+User: "Explain how the authentication middleware works and whether it handles token refresh"
+
+Announce: "I need to check the auth middleware implementation and search for token
+refresh handling before I can answer this."
+
+Investigation plan:
+1. Find the auth middleware: grep -r "middleware" or grep -r "authenticate"
+2. Read the middleware file completely
+3. Search for "refresh" or "token" in that file and related files
+4. Check what routes use this middleware
+
+I will NOT answer until I have read the actual middleware code.
+```
+
+### Step 3: Break Down Complex Problems
+
+If the request involves multiple parts or a non-obvious problem, decompose it into checkable pieces.
+
+**How to decompose:**
+
+1. List each distinct sub-question
+2. For each sub-question, identify what evidence answers it
+3. Answer each sub-question independently with its own evidence
+4. Combine into a coherent answer
+
+**When to do this:** Any request that can't be answered by reading a single file, any debugging task, any "how does X work" question about a multi-file system.
+
+**Example:**
+```
+User: "Why is the order total wrong on the checkout page?"
+
+Decomposition:
+1. Where is the order total calculated? → Need to find the calculation code
+2. What inputs does it use? → Need to read what data feeds into the calculation
+3. Are the inputs correct? → Need to trace where each input comes from
+4. Is the calculation logic correct? → Need to read and verify the math
+5. Is the display correct? → Need to check if the UI shows what the backend sends
+
+Each of these is a checkable piece. I answer them in order, with evidence.
+```
+
+### Step 4: Formulate Your Response From Evidence
+
+Now — and ONLY now — formulate your answer.
+
+**Rules for your response:**
+- Every claim MUST be traceable to something you read, ran, or verified
+- If you read a file, cite it: "In `auth.ts` (line 45), the middleware checks..."
+- If you ran a command, show the output
+- If you couldn't verify something, say so explicitly: "I haven't verified whether X handles Y — would need to check Z"
+- You MUST distinguish between what you KNOW (read the code) and what you INFER (logical conclusion from code)
+
+### Step 5: Self-Verify Before Sending
+
+IMMEDIATELY before sending your response, run this checklist. Do NOT skip this step:
+
+- [ ] Did I make any claim about code I haven't read in this conversation? → Go read it now.
+- [ ] Did I use "probably", "likely", "should", or "I believe" about factual code behavior? → Replace with certainty or explicit uncertainty now.
+- [ ] Did I suggest a fix without verifying the problem exists? → Verify now.
+- [ ] Did I reference functions, APIs, or packages without checking they exist? → Check now.
+- [ ] Could any part of my answer be completely wrong if I checked the code? → Check it now.
 
 ---
 
-## 3. System Architecture
+## Automatic Triggers
 
-claude-memory is a **Python CLI tool** with no background services, no daemons,
-and no process managers. Every operation is a standalone CLI invocation triggered
-either by Claude Code hooks or by the user directly.
+When you encounter these specific situations, the paired action is MANDATORY:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Claude Code Session                     │
-│                                                              │
-│  ┌──────────┐    ┌──────────────┐    ┌──────────────────┐   │
-│  │ Session   │    │ PreToolUse / │    │ Session End      │   │
-│  │ Start     │    │ PostToolUse  │    │                  │   │
-│  │ Hook      │    │ Hook         │    │ Hook             │   │
-│  └─────┬─────┘    └──────┬───────┘    └────────┬─────────┘   │
-│        │                │                     │             │
-└────────┼────────────────┼─────────────────────┼─────────────┘
-         │                │                     │
-         ▼                ▼                     ▼
-   claude-memory    claude-memory         claude-memory
-     inject           capture               compress
-         │                │                     │
-         │                ▼                     │
-         │        ┌──────────────┐              │
-         │        │   SQLite DB  │◄─────────────┘
-         └───────►│  (~/.claude- │
-                  │   memory/)   │
-                  └──────────────┘
-```
-
-### Four Core Operations
-
-1. **`inject`** — Called at session start via `SessionStart` hook. Queries SQLite
-   for relevant context (recent workspace knowledge, global patterns, last session
-   summary), formats it as structured markdown, and outputs to stdout for Claude
-   Code to consume as system prompt context.
-
-2. **`capture`** — Called on every tool call via `PreToolUse`/`PostToolUse` hooks.
-   Receives tool name and input/output via stdin, applies privacy filtering, and
-   stores a raw observation in SQLite.
-
-3. **`compress`** — Called at session end via `SessionEnd` hook. Loads all
-   non-private observations for the session, groups them by file cluster, sends
-   each group to Claude Code CLI for AI-powered knowledge extraction, and stores
-   the resulting structured knowledge entries. Also generates an end-of-session
-   summary.
-
-4. **`remember`** — User-invoked command. Explicitly saves a piece of knowledge
-   with a specified type and scope. Bypasses the capture→compress pipeline.
-
-### Data Flow
-
-```
-Raw tool calls ──► capture ──► observations table (raw, ephemeral)
-                                      │
-                                      ▼
-                               compress (AI) ──► knowledge table (structured, permanent)
-                                      │
-                                      ▼
-                               session_summaries table
-                                      │
-                                      ▼
-Knowledge + Summaries ──► inject ──► context in next session
-```
+| When you... | You MUST... |
+|---|---|
+| See an error message | Read the FULL error AND the file/line it references BEFORE commenting on it |
+| Are asked "how does X work" | Read X's implementation BEFORE explaining it |
+| Are asked to fix a bug | Reproduce or verify the bug exists BEFORE proposing a fix |
+| Are about to write "probably" or "likely" | STOP. Read the code. Replace with fact or explicit uncertainty |
+| Are about to suggest a code change | Read the current file contents BEFORE suggesting the change |
+| Are asked about a function's behavior | Read the function body BEFORE describing what it does |
+| Are about to reference a third-party API | Verify the method signature exists BEFORE using it |
+| Recall something from earlier in conversation | Re-read the file if there is ANY chance it changed |
 
 ---
 
-## 4. Database Schema
+## Code Reading Strategy
 
-All data lives in a single SQLite database at `~/.claude-memory/claude-memory.db`
-with WAL (Write-Ahead Logging) mode enabled for safe concurrent read/write access.
+### How to Read Code Effectively
 
-### 4.1 `sessions` Table
+**Don't just open a file and skim.** Follow this approach:
 
-Tracks each Claude Code session.
+1. **Start with the entry point** — Find where the relevant flow begins (route handler, event listener, main function, test case)
+2. **Trace the execution path** — Follow the code as it would execute: what calls what, what data flows where
+3. **Read called functions** — When the code calls another function, open that function and read it too. Don't assume what it does from the name.
+4. **Check types and interfaces** — If there are type definitions, read them. They tell you the contract.
+5. **Look at error handling** — What happens on the unhappy path? This is often where bugs live.
 
-| Column              | Type     | Constraints       | Description                              |
-|---------------------|----------|-------------------|------------------------------------------|
-| `id`                | TEXT     | PRIMARY KEY       | UUID                                     |
-| `claude_session_id` | TEXT     | UNIQUE, NOT NULL  | Claude Code's own session identifier     |
-| `workspace`         | TEXT     | NOT NULL          | Workspace directory path                 |
-| `workspace_name`    | TEXT     | NOT NULL          | Extracted workspace name (basename)      |
-| `initial_prompt`    | TEXT     |                   | The first user prompt of the session     |
-| `status`            | TEXT     | NOT NULL          | `active`, `completed`, `error`, `compression_pending` |
-| `observation_count` | INTEGER  | DEFAULT 0         | Running count of tool calls captured     |
-| `created_at`        | DATETIME | NOT NULL          | Session start time (ISO 8601)            |
-| `completed_at`      | DATETIME |                   | Session end time (ISO 8601)              |
+### When to Read Code
 
-**Indexes:**
-- `idx_sessions_workspace` on `(workspace)`
-- `idx_sessions_status` on `(status)`
-- `idx_sessions_created` on `(created_at DESC)`
+| Situation | What to read |
+|---|---|
+| "How does X work?" | The implementation of X, its callers, its dependencies |
+| "X is broken" | X's code, recent changes to X (`git log`), X's tests, error logs |
+| "Add feature Y to X" | X's current code, similar features for patterns, X's tests |
+| "What does this error mean?" | The full error message, the file and line it points to, the surrounding code |
+| "Is it safe to change X?" | X's callers (`grep`), X's tests, X's type contract |
 
-### 4.2 `observations` Table
+### Parallel Investigation With Subagents
 
-Raw tool-call captures (pre-compression). Ephemeral — designed to be pruned
-after compression.
+For complex tasks, dispatch subagents to investigate independently. Each subagent MUST:
 
-| Column           | Type     | Constraints       | Description                                  |
-|------------------|----------|-------------------|----------------------------------------------|
-| `id`             | TEXT     | PRIMARY KEY       | UUID                                         |
-| `session_id`     | TEXT     | FK → sessions.id  | Parent session                               |
-| `tool_name`      | TEXT     | NOT NULL          | e.g., `write_to_file`, `run_command`, `grep` |
-| `hook_type`      | TEXT     | NOT NULL          | `pre` or `post`                              |
-| `tool_input`     | TEXT     |                   | Truncated input payload (JSON, ≤2000 chars)  |
-| `tool_output`    | TEXT     |                   | Truncated output payload (JSON, ≤4000 chars) |
-| `files_read`     | TEXT     |                   | JSON array of files read                     |
-| `files_modified`  | TEXT     |                   | JSON array of files written/modified         |
-| `is_private`     | BOOLEAN  | DEFAULT false     | True if within `<private>` scope or matched by privacy rule |
-| `created_at`     | DATETIME | NOT NULL          | When the tool call occurred                  |
+1. Have a clear, specific question to answer
+2. Read the actual code to answer it
+3. Report back with evidence, not opinions
 
-**Indexes:**
-- `idx_observations_session` on `(session_id)`
-- `idx_observations_private` on `(is_private)`
-
-### 4.3 `knowledge` Table
-
-Compressed, structured knowledge entries (post-compression). Permanent storage.
-
-| Column           | Type     | Constraints       | Description                                  |
-|------------------|----------|-------------------|----------------------------------------------|
-| `id`             | TEXT     | PRIMARY KEY       | UUID                                         |
-| `session_id`     | TEXT     | FK → sessions.id, NULLABLE | Source session (NULL for manual `remember` entries) |
-| `workspace`      | TEXT     |                   | Workspace path (NULL for global scope)       |
-| `scope`          | TEXT     | NOT NULL          | `workspace` or `global`                      |
-| `type`           | TEXT     | NOT NULL          | See Knowledge Types below                    |
-| `priority`       | INTEGER  | NOT NULL          | 1–5, derived from type hierarchy             |
-| `title`          | TEXT     | NOT NULL          | One-line summary                             |
-| `narrative`      | TEXT     | NOT NULL          | 2–3 sentence natural language description    |
-| `facts`          | TEXT     |                   | JSON array of concrete, atomic facts         |
-| `concepts`       | TEXT     |                   | JSON array of concept tags                   |
-| `files_involved` | TEXT     |                   | JSON array of file paths                     |
-| `created_at`     | DATETIME | NOT NULL          | When the knowledge was created               |
-
-**Indexes:**
-- `idx_knowledge_workspace` on `(workspace)`
-- `idx_knowledge_scope` on `(scope)`
-- `idx_knowledge_type` on `(type)`
-- `idx_knowledge_priority` on `(priority DESC, created_at DESC)`
-- `idx_knowledge_created` on `(created_at DESC)`
-
-#### Knowledge Types & Priority Hierarchy
-
-| Priority | Type        | Description                                     |
-|----------|-------------|-------------------------------------------------|
-| 5        | `decision`  | Architectural choices, "we chose X over Y because..." |
-| 4        | `pattern`   | Reusable approaches, coding patterns, conventions |
-| 3        | `bugfix`    | Bug fixes with root cause analysis               |
-| 3        | `solution`  | Solutions to tricky problems                     |
-| 2        | `feature`   | New functionality built                          |
-| 2        | `refactor`  | Code restructuring                               |
-| 1        | `discovery` | General learnings, context, observations         |
-
-### 4.4 `session_summaries` Table
-
-AI-generated end-of-session summaries.
-
-| Column         | Type     | Constraints       | Description                    |
-|----------------|----------|-------------------|--------------------------------|
-| `id`           | TEXT     | PRIMARY KEY       | UUID                           |
-| `session_id`   | TEXT     | FK → sessions.id  | Parent session                 |
-| `workspace`    | TEXT     | NOT NULL          | Workspace path                 |
-| `request`      | TEXT     | NOT NULL          | What was the user trying to do |
-| `investigated` | TEXT     | NOT NULL          | What was explored/researched   |
-| `learned`      | TEXT     | NOT NULL          | Key learnings and discoveries  |
-| `completed`    | TEXT     | NOT NULL          | What was accomplished          |
-| `next_steps`   | TEXT     |                   | Suggested follow-ups           |
-| `created_at`   | DATETIME | NOT NULL          | When summary was generated     |
-
-**Indexes:**
-- `idx_summaries_workspace` on `(workspace)`
-- `idx_summaries_session` on `(session_id)`
-- `idx_summaries_created` on `(created_at DESC)`
-
-### 4.5 `privacy_rules` Table
-
-User-defined exclusion rules.
-
-| Column       | Type     | Constraints  | Description                            |
-|--------------|----------|--------------|----------------------------------------|
-| `id`         | TEXT     | PRIMARY KEY  | UUID                                   |
-| `rule_type`  | TEXT     | NOT NULL     | `file_pattern`, `directory`, `keyword` |
-| `pattern`    | TEXT     | NOT NULL     | Glob pattern, path, or keyword         |
-| `created_at` | DATETIME | NOT NULL     | When rule was added                    |
-
-### 4.6 FTS5 Virtual Tables
-
-```sql
--- Full-text search over knowledge entries
-CREATE VIRTUAL TABLE knowledge_fts USING fts5(
-    title, narrative, facts, concepts,
-    content='knowledge', content_rowid='rowid'
-);
-
--- Full-text search over session summaries
-CREATE VIRTUAL TABLE summaries_fts USING fts5(
-    request, investigated, learned, completed, next_steps,
-    content='session_summaries', content_rowid='rowid'
-);
+**Example — debugging a broken feature:**
 ```
+Main task: "Payments are failing silently"
 
-FTS5 indexes are maintained via triggers that fire on INSERT, UPDATE, and DELETE
-to the parent tables.
+Dispatch in parallel:
+- Subagent 1: "Read the payment processing code in src/payments/. Trace what happens when a payment is submitted. Report the exact flow and any error handling."
+- Subagent 2: "Check git log for the payments directory. What changed in the last 5 commits? Report the diffs."
+- Subagent 3: "Read the payment test files. What scenarios are tested? Are there tests for failure cases?"
 
-### 4.7 Schema Versioning
-
-A `schema_version` table tracks the current schema version:
-
-| Column    | Type    | Description                  |
-|-----------|---------|------------------------------|
-| `version` | INTEGER | Current schema version number |
-
-Migrations are applied sequentially. Each migration is a Python function in
-`db/migrations.py` that receives a database connection.
-
----
-
-## 5. CLI Interface
-
-The tool is installed as `claude-memory` (with short alias `cmem`) and uses
-Click for command parsing.
-
-### 5.1 Core Lifecycle Commands (Called by Hooks)
-
-```bash
-# Session start — inject relevant context to stdout
-claude-memory inject \
-    --workspace /path/to/project \
-    --session-id <claude-session-id>
-
-# Tool call — capture raw observation from stdin
-echo '{"input": {...}, "output": {...}}' | \
-claude-memory capture \
-    --session-id <claude-session-id> \
-    --tool <tool-name> \
-    --hook pre|post
-
-# Session end — compress observations into knowledge
-claude-memory compress --session-id <claude-session-id>
-```
-
-### 5.2 Manual Commands (User-Invoked)
-
-```bash
-# Explicitly save a piece of knowledge
-claude-memory remember "We chose PostgreSQL over MongoDB because our data is relational" \
-    --type decision \
-    --scope global
-
-claude-memory remember "Use retry decorator for flaky API calls" \
-    --type pattern \
-    --scope workspace
-
-# Search across all memories
-claude-memory search "authentication pattern"
-claude-memory search "how did we fix the race condition" --workspace ./
-claude-memory search "error handling" --type decision --scope global
-
-# Browse recent knowledge entries
-claude-memory log                                    # last 20 entries
-claude-memory log --workspace ./ --limit 50          # workspace-specific
-claude-memory log --type decision                    # filter by type
-claude-memory log --type pattern --scope global      # global patterns only
-
-# View a specific session's knowledge
-claude-memory session <session-id>
-claude-memory session --last                         # most recent session
-
-# Launch setup
-claude-memory init                                   # create DB + config
-claude-memory install                                # configure Claude Code hooks
-claude-memory uninstall                              # remove hooks
-
-# Privacy rule management
-claude-memory privacy add --file-pattern "*.env"
-claude-memory privacy add --directory "/secrets"
-claude-memory privacy add --keyword "API_KEY"
-claude-memory privacy list
-claude-memory privacy remove <rule-id>
-
-# Database maintenance
-claude-memory stats                                  # storage stats, entry counts
-claude-memory export --format json                   # export all knowledge
-claude-memory prune --older-than 90d                 # remove old raw observations
-claude-memory prune --keep-knowledge                 # prune observations, keep knowledge
-claude-memory compress --retry                       # retry failed compressions
-claude-memory repair                                 # integrity check + rebuild
-claude-memory migrate-workspace --from /old --to /new # update workspace paths
-```
-
-### 5.3 Global Options
-
-All commands support:
-- `--verbose` / `-v` — Debug output to stderr
-- `--config <path>` — Override config file location
-- `--db <path>` — Override database file location
-
-### 5.4 Output Contract
-
-- **stdout** is reserved for data consumed by Claude Code (especially `inject` output)
-- **stderr** is used for log messages, errors, and progress indicators
-- Hook commands **always exit 0** even on internal errors, to never block Claude Code
-- `--format json` flag available on `search`, `log`, `session`, `stats` for machine-readable output
-
----
-
-## 6. Claude Code Hook Configuration
-
-### 6.1 `claude-memory install` Behavior
-
-The `install` command detects Claude Code's settings location and writes hook
-configuration. It supports both workspace-level (`.claude/settings.json`) and
-user-level (`~/.claude/settings.json`) installation.
-
-### 6.2 Hook Configuration
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "*",
-        "command": "claude-memory capture --session-id $CLAUDE_SESSION_ID --tool $TOOL_NAME --hook pre"
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "*",
-        "command": "claude-memory capture --session-id $CLAUDE_SESSION_ID --tool $TOOL_NAME --hook post"
-      }
-    ],
-    "SessionStart": [
-      {
-        "command": "claude-memory inject --workspace $PWD --session-id $CLAUDE_SESSION_ID"
-      }
-    ],
-    "SessionEnd": [
-      {
-        "command": "claude-memory compress --session-id $CLAUDE_SESSION_ID"
-      }
-    ]
-  }
-}
-```
-
-### 6.3 Hook Environment Variables
-
-The hooks rely on Claude Code providing these environment variables:
-- `$CLAUDE_SESSION_ID` — Unique session identifier
-- `$TOOL_NAME` — Name of the tool being called (for `PreToolUse`/`PostToolUse`)
-- `$PWD` — Current working directory (workspace path)
-
-Tool input/output is passed via stdin as JSON for `PreToolUse`/`PostToolUse` hooks.
-
----
-
-## 7. Context Injection Strategy
-
-### 7.1 What Gets Injected
-
-At session start, `inject` constructs a context block from four sources:
-
-1. **Recent workspace knowledge** — Last N knowledge entries for this workspace,
-   ordered by `priority DESC, created_at DESC`. Default: 10 entries.
-2. **Last session summary** — The most recent session summary for this workspace.
-3. **Global high-priority knowledge** — Top M global-scope entries with
-   `priority >= 4` (decisions & patterns only). Default: 5 entries.
-4. **Pending next steps** — Any `next_steps` from the last session summary that
-   haven't been addressed yet.
-
-### 7.2 Token Budget
-
-Total injected context is capped at a configurable token budget (default: 4000
-tokens). Token count is estimated using a simple heuristic: `len(text) / 4`.
-
-If the assembled context exceeds the budget:
-1. Lower-priority entries are dropped first
-2. Within the same priority, older entries are dropped first
-3. The session summary is always kept (it's the highest-signal, most compact item)
-4. At least one entry from each source is kept if possible
-
-### 7.3 Output Format
-
-The injected context is formatted as structured markdown:
-
-```markdown
-## claude-memory: Session Context
-
-### Last Session Summary
-**Request:** [what was asked]
-**Completed:** [what was done]
-**Next Steps:** [what to do next]
-
-### Recent Workspace Knowledge
-1. **[DECISION]** Title of decision — narrative
-2. **[PATTERN]** Title of pattern — narrative
-3. **[BUGFIX]** Title of bugfix — narrative
-
-### Global Patterns & Decisions
-1. **[PATTERN]** Title — narrative
-2. **[DECISION]** Title — narrative
+Wait for all three → synthesize findings → identify root cause with evidence
 ```
 
 ---
 
-## 8. AI Compression Pipeline
+## Verification — How to Check Your Own Work
 
-### 8.1 Capture Phase (During Session)
+### Verifying Code Explanations
 
-Every tool call captured by hooks is stored as a raw observation with these
-processing steps:
+After explaining how code works, verify:
+1. Re-read the code path you described — did you miss a branch, an early return, a middleware?
+2. Check your claim against the actual types — does the function really return what you said?
+3. Look for edge cases you ignored — what happens with null, empty, error states?
 
-1. **Input truncation**: Tool inputs > 2000 chars are truncated with `[truncated]`
-2. **Output truncation**: Tool outputs > 4000 chars are truncated
-3. **File extraction**: File paths are extracted from tool inputs/outputs and
-   stored in `files_read` / `files_modified`
-4. **Privacy filtering**: Content is checked against privacy rules and inline
-   `<private>` tags. Matching observations are marked `is_private=true`.
-5. **Deduplication**: Repeated reads of the same file within a session are
-   collapsed (only first read stored)
-6. **Tool filtering**: Low-signal tools listed in `config.toml`'s `ignore_tools`
-   are skipped entirely
+### Verifying Fixes
 
-### 8.2 Compression Phase (End of Session)
+Before claiming a fix is correct:
+1. Does the fix address the ROOT CAUSE, not a symptom?
+2. Read the surrounding code — does the fix break anything else?
+3. If possible, run the tests. If tests pass, say so with the output. If you can't run them, say that.
+4. Trace through the fix mentally with the original failing case — does it actually resolve it?
 
-When `claude-memory compress` runs:
+### Verifying "Does X exist?"
 
-1. **Load** all non-private observations for the session
-2. **Skip** if fewer than `min_observations` (default: 3) observations exist
-3. **Group** observations by logical activity using file-cluster heuristic:
-   observations touching the same files within a time window are grouped together
-4. **Filter** out low-signal observations (simple file reads, `ls` commands, etc.)
-5. **Construct compression prompt** for each group
-6. **Send to Claude Code CLI** via subprocess:
-   ```bash
-   echo "<prompt>" | claude -p --output-format json
-   ```
-7. **Parse JSON response** into Knowledge entries
-8. **Insert** knowledge entries with appropriate priority scores
-9. **Generate session summary** using a separate prompt
-10. **Sync FTS5 indexes** after all inserts
-11. **Update session status** to `completed`
-
-### 8.3 Knowledge Extraction Prompt
-
-```
-You are a knowledge extraction system. Given these raw tool observations from
-a coding session, extract structured knowledge entries.
-
-For each distinct piece of knowledge, output a JSON array of objects with:
-- type: one of "decision", "pattern", "bugfix", "solution", "feature",
-  "discovery", "refactor"
-- scope: "workspace" if specific to this codebase, "global" if a general
-  technique/pattern applicable anywhere
-- title: one-line summary (imperative mood, e.g., "Use retry decorator for
-  flaky API calls")
-- narrative: 2-3 sentence natural language description of what happened and why
-- facts: array of concrete, atomic facts (e.g., ["SQLite FTS5 requires
-  content= for external content tables"])
-- concepts: array of concept tags (e.g., ["error-handling", "retry-pattern"])
-- files_involved: array of file paths that were central to this knowledge
-
-Prioritize extracting:
-1. Decisions and WHY they were made (highest value)
-2. Patterns that could be reused
-3. Bug fixes and their root causes
-4. What was built or changed
-
-Output valid JSON only. No markdown fencing. No commentary.
-
-Raw observations:
-{observations_json}
-```
-
-### 8.4 Session Summary Prompt
-
-```
-Summarize this coding session. Output a JSON object with these fields:
-- request: What was the user trying to accomplish? (1-2 sentences)
-- investigated: What was explored or researched? (1-2 sentences)
-- learned: Key learnings and discoveries (1-3 bullet points)
-- completed: What was accomplished? (1-2 sentences)
-- next_steps: What should be done next? (1-3 bullet points, or null if none)
-
-Output valid JSON only. No markdown fencing. No commentary.
-
-Session observations:
-{observations_json}
-```
-
-### 8.5 Batching Strategy
-
-For sessions with many observations:
-- Observations are batched into groups of ~30
-- Each batch is compressed independently
-- Batching is done by file-cluster first, then by time proximity
-- Each compression call produces its own set of knowledge entries
-- The session summary prompt receives a representative sample (first 10 + last 10
-  observations) if total exceeds 50
+Before using any function, API, package, or file in your answer:
+1. Search for it: `grep -r "function_name"` or check the dependency file
+2. If it doesn't exist, don't reference it. Don't invent it. Don't assume it.
+3. If you're recommending a third-party package, verify its actual API — don't guess the method signatures
 
 ---
 
-## 9. Privacy & Security System
+## Examples — The Right Way vs. The Wrong Way
 
-### 9.1 Three Layers of Protection
+### Example 1: "How does the caching work?"
 
-**Layer 1: Inline `<private>` Tags**
+**WRONG (guessing from file names):**
+```
+The caching system uses Redis. The cache.ts file likely exports a CacheService
+class that handles get/set operations with TTL support. The middleware probably
+checks the cache before hitting the database.
+```
+Every sentence here is a guess. "likely", "probably" — none of this is evidence.
 
-Anything wrapped in `<private>` tags during a Claude Code session is excluded:
-- Observations are stored with `is_private=true`
-- Private observations are never sent to compression
-- Private observations are never returned by `inject` or `search`
-- They remain in the DB for audit but are invisible to retrieval
+**RIGHT (reading code first):**
+```
+I need to check the caching implementation before I can explain this.
 
-**Layer 2: Persistent Privacy Rules**
+[reads src/cache.ts]
+[reads src/middleware/cache-middleware.ts]
+[greps for cache usage across the codebase]
 
-Rules stored in `privacy_rules` table, applied automatically:
+The caching works as follows:
 
-```bash
-claude-memory privacy add --file-pattern "*.env"      # file glob patterns
-claude-memory privacy add --directory "/secrets"       # directory blackholes
-claude-memory privacy add --keyword "API_KEY"          # content keyword matching
+1. `src/cache.ts` (line 12-34) exports a `createCache()` function — not a class — that
+   returns an object with `get(key)` and `set(key, value, ttlSeconds)` methods.
+   It uses an in-memory Map, not Redis.
+
+2. The cache middleware (`src/middleware/cache-middleware.ts`, line 8) wraps route
+   handlers. It generates a cache key from `req.method + req.url` (line 15) and
+   checks the cache before calling the handler.
+
+3. TTL is hardcoded to 300 seconds (line 20). There's no per-route configuration.
+
+Note: I didn't find any Redis dependency in package.json — this is purely in-memory
+caching, which means it resets on server restart.
 ```
 
-Matching logic during capture:
-1. Check `files_read`/`files_modified` against file pattern and directory rules
-2. Check `tool_input`/`tool_output` against keyword rules
-3. Any match → `is_private=true`
+### Example 2: "Fix the bug where users can't update their profile"
 
-**Layer 3: Config-Level Exclusions**
+**WRONG (jumping to a solution):**
+```
+The issue is probably in the profile update endpoint. Try changing the PUT route
+to use `req.body` instead of `req.params` for the profile data. Also make sure
+the validation middleware is applied.
+```
+This is pure guesswork. No file was read. No error was checked.
 
-Baseline patterns in `config.toml`:
+**RIGHT (investigating first):**
+```
+I need to check the profile update route, the service layer, and any recent
+changes before I can diagnose this.
 
-```toml
-[privacy]
-exclude_patterns = ["*.env", "*.pem", "*.key", "*.secret"]
+1. First, find the profile update code:
+   [runs: grep -r "profile" src/routes/]
+   Found: src/routes/user.ts contains PUT /api/users/:id/profile
+
+2. Read the route handler:
+   [reads src/routes/user.ts, lines 45-78]
+   The handler reads profile data from req.body (line 52) and calls
+   userService.updateProfile(id, data) on line 56.
+
+3. Read updateProfile:
+   [reads src/services/userService.ts, lines 89-112]
+   Found the issue: line 95 runs a SQL query with `WHERE id = $1` but the
+   parameter passed is `data.userId` (line 94), not the `id` parameter from
+   the route. The `data` object from req.body doesn't have a `userId` field —
+   the ID comes from the URL parameter.
+
+4. Verify: the route passes `req.params.id` as the first argument (user.ts line 56),
+   but updateProfile ignores it and uses `data.userId` which is undefined.
+
+Root cause: `userService.ts` line 94 uses `data.userId` instead of the `id`
+parameter. The fix is to use the `id` parameter passed to the function.
+
+Fix:
+- Line 94 in src/services/userService.ts: change `data.userId` to `id`
 ```
 
-### 9.2 Pre-Compression Sanitization
+### Example 3: Multi-part question with parallel investigation
 
-Before sending observations to Claude Code CLI:
-1. All `is_private=true` observations are filtered out
-2. Keyword-matched strings are replaced with `[REDACTED]`
-3. File paths matching privacy patterns are replaced with `[PRIVATE_FILE]`
+**User asks:** "Is our API rate limiting working correctly, and are we logging rate limit violations?"
 
-### 9.3 Data Locality
+**RIGHT (decompose and investigate in parallel):**
+```
+Two independent questions here. I need to check the rate limiting middleware and
+the logging setup before I can answer either.
 
-- All storage is local SQLite at `~/.claude-memory/`
-- No data is sent to any external service
-- AI compression uses Claude Code CLI which runs through the user's existing
-  Anthropic authentication — no additional API keys needed
-- No telemetry, no analytics, no phone-home
+[Subagent 1: Find and read the rate limiting middleware — what does it do, how
+ is it configured, what happens when a limit is hit?]
 
----
+[Subagent 2: Search for rate-limit-related logging — grep for "rate" and "limit"
+ in the logging code, check what gets logged when a violation occurs]
 
-## 10. Error Handling
+--- After both subagents report back ---
 
-| Scenario                                | Behavior                                                                                             |
-|-----------------------------------------|------------------------------------------------------------------------------------------------------|
-| Claude Code CLI unavailable at compress | Observations preserved, session status set to `compression_pending`. `compress --retry` re-attempts. |
-| Claude Code CLI returns bad JSON        | Raw prompt + response logged to `~/.claude-memory/errors/`. Observations preserved. Warning on stderr. |
-| Database locked (concurrent access)     | WAL mode handles concurrent reads. Writes retry with exponential backoff (3 attempts: 100/200/400ms). |
-| Hook fails                              | Hooks always exit 0. Internal errors are logged to `~/.claude-memory/errors/`, never block Claude Code. |
-| Disk full                               | Graceful error message to stderr. `stats` command shows DB size for diagnosis.                       |
-| Corrupted database                      | `repair` command runs integrity check + rebuild. If unrecoverable, backs up and creates fresh DB.    |
-| Schema version mismatch                 | Auto-applies pending migrations on first access. Backward-compatible.                                 |
+Rate Limiting:
+- The rate limiter is in src/middleware/rateLimiter.ts (lines 5-42)
+- It uses a sliding window algorithm with a Map<string, number[]> (line 8)
+- Default: 100 requests per 60 seconds per IP (line 10-11)
+- When exceeded: returns 429 with {"error": "Too many requests"} (line 35)
+- Issue found: the window cleanup on line 28 uses `>` instead of `>=`, so the
+  101st request in exactly 60 seconds is allowed. Off-by-one bug.
 
----
+Logging:
+- Rate limit violations are NOT logged. The 429 response is sent (line 35) but
+  there's no logger.warn() or similar call. The general request logger in
+  src/middleware/requestLogger.ts (line 12) only logs requests that reach a
+  route handler — 429s from the rate limiter happen before that.
 
-## 11. Edge Cases
-
-| Case                              | Handling                                                                                        |
-|-----------------------------------|-------------------------------------------------------------------------------------------------|
-| Very short session (< 3 obs)      | Skip compression (configurable). Still record session metadata.                                 |
-| Very long session (100s of calls)  | Batch observations into chunks of ~30 for compression.                                          |
-| Same workspace, different branches | Workspace = directory path. Branch-level scoping not tracked.                                   |
-| Workspace renamed/moved           | Old knowledge remains. `migrate-workspace --from /old --to /new` command updates paths.         |
-| Multiple concurrent sessions      | Each session has unique ID. WAL mode ensures safe concurrent writes.                            |
-| No internet / offline             | Capture and inject work fully offline. Compress queues for retry.                               |
-
----
-
-## 12. Performance Requirements
-
-| Operation   | Target Latency | Notes                                          |
-|-------------|----------------|-------------------------------------------------|
-| `capture`   | < 100ms        | Single SQLite INSERT. Must never slow Claude Code. |
-| `inject`    | < 50ms         | One SELECT with LIMIT + ORDER BY.              |
-| `compress`  | 5–30 seconds   | AI call. Runs at session end, user isn't waiting. |
-| `search`    | < 200ms        | FTS5 query + result formatting.                |
-| DB size     | < 500MB        | For years of typical use with truncation limits. |
-
----
-
-## 13. Configuration
-
-Configuration lives at `~/.claude-memory/config.toml`:
-
-```toml
-[general]
-db_path = "~/.claude-memory/claude-memory.db"
-token_budget = 4000
-log_level = "info"                          # debug, info, warn, error
-
-[capture]
-input_max_chars = 2000
-output_max_chars = 4000
-ignore_tools = ["grep", "glob"]             # low-signal tools to skip
-deduplicate_reads = true
-
-[compression]
-batch_by_files = true
-min_observations = 3
-auto_compress = true                        # set false for manual control
-
-[inject]
-workspace_entries = 10
-global_entries = 5
-min_priority = 1
-include_last_summary = true
-
-[privacy]
-exclude_patterns = ["*.env", "*.pem", "*.key", "*.secret"]
+So: rate limiting mostly works but has an off-by-one edge case, and violations
+are not logged at all.
 ```
 
 ---
 
-## 14. File Layout
+## STOP Signs
 
-### 14.1 On-Disk Structure
+If you catch yourself doing ANY of these, STOP and correct course:
 
-```
-~/.claude-memory/
-├── claude-memory.db              # SQLite database (WAL mode)
-├── claude-memory.db-wal          # WAL file (auto-managed)
-├── claude-memory.db-shm          # Shared memory (auto-managed)
-├── config.toml                   # User configuration
-└── errors/                       # Failed compression logs
-    └── 2026-07-05_<session-id>.json
-```
+| Doing this... | Do this instead |
+|---|---|
+| Claiming what code does without having read it | Open the file, read the code, then state facts |
+| Using "probably", "likely", "should" about code behavior | Read the code and replace with certainty or explicit uncertainty |
+| Providing a solution before confirming the problem exists | Investigate the problem first, then solve |
+| Describing a function based on its name, not its body | Read the function body, then describe |
+| Answering a complex question in one shot | Decompose, investigate each piece, then synthesize |
+| Suggesting file edits without reading current contents | Read the file first, then suggest changes |
+| Assuming an error's cause without reading the full error and code | Read the complete error, trace to the source |
+| Calling functions or APIs without checking they exist | Verify existence and signature before using |
+| Generating import statements without verifying packages | Check the dependency file first |
+| Saying "I've seen this before" as justification | That is not evidence. Read the actual code. |
 
-### 14.2 Python Package Structure
+## Common Rationalizations — Do Not Fall For These
 
-```
-claude-memory/
-├── pyproject.toml
-├── README.md
-├── src/
-│   └── claude_memory/
-│       ├── __init__.py
-│       ├── __main__.py                 # python -m claude_memory support
-│       │
-│       ├── cli/                        # CLI layer — one file per command group
-│       │   ├── __init__.py             # Click group registration
-│       │   ├── main.py                 # Top-level CLI group + global options
-│       │   ├── capture.py              # capture command
-│       │   ├── compress.py             # compress command
-│       │   ├── inject.py               # inject command
-│       │   ├── search.py               # search, log commands
-│       │   ├── remember.py             # remember command (manual save)
-│       │   ├── session.py              # session browsing commands
-│       │   ├── privacy.py              # privacy rule management commands
-│       │   ├── install.py              # install/uninstall hooks
-│       │   ├── maintenance.py          # stats, export, prune, init, repair
-│       │   └── formatters.py           # Output formatting (table, json, markdown)
-│       │
-│       ├── core/                       # Business logic — no CLI or DB awareness
-│       │   ├── __init__.py
-│       │   ├── capture.py              # Observation capture logic + filtering
-│       │   ├── compress.py             # Compression orchestration + prompt building
-│       │   ├── inject.py               # Context selection + ranking + budget
-│       │   ├── search.py               # Search query building + result ranking
-│       │   ├── privacy.py              # Privacy rule matching engine
-│       │   └── hooks.py                # Hook config generation logic
-│       │
-│       ├── models/                     # Data classes — pure data, no logic
-│       │   ├── __init__.py
-│       │   ├── session.py              # Session dataclass
-│       │   ├── observation.py          # Observation dataclass
-│       │   ├── knowledge.py            # Knowledge entry dataclass
-│       │   ├── summary.py              # Session summary dataclass
-│       │   ├── privacy.py              # Privacy rule dataclass
-│       │   └── enums.py                # KnowledgeType, Scope, Priority, Status enums
-│       │
-│       ├── db/                         # Database layer — swappable
-│       │   ├── __init__.py
-│       │   ├── connection.py           # DB connection manager (WAL, pragmas)
-│       │   ├── schema.py               # Table definitions + FTS5 setup
-│       │   ├── migrations.py           # Schema versioning + migration runner
-│       │   ├── repositories/           # One repository per aggregate
-│       │   │   ├── __init__.py
-│       │   │   ├── session_repo.py     # CRUD for sessions
-│       │   │   ├── observation_repo.py # CRUD for observations
-│       │   │   ├── knowledge_repo.py   # CRUD + FTS queries for knowledge
-│       │   │   ├── summary_repo.py     # CRUD for session summaries
-│       │   │   └── privacy_repo.py     # CRUD for privacy rules
-│       │   └── queries/                # Complex queries isolated as SQL
-│       │       ├── __init__.py
-│       │       ├── search_queries.py   # FTS5 search queries
-│       │       └── inject_queries.py   # Context injection ranking queries
-│       │
-│       ├── ai/                         # AI integration layer — swappable provider
-│       │   ├── __init__.py
-│       │   ├── base.py                 # Abstract base class for AI providers
-│       │   ├── claude_code.py          # Claude Code CLI provider (subprocess)
-│       │   ├── prompts/                # Prompt templates isolated from logic
-│       │   │   ├── __init__.py
-│       │   │   ├── compression.py      # Knowledge extraction prompt
-│       │   │   ├── summarization.py    # Session summary prompt
-│       │   │   └── templates.py        # Shared prompt fragments
-│       │   └── parsers/                # Response parsing
-│       │       ├── __init__.py
-│       │       ├── knowledge_parser.py # Parse AI output → Knowledge entries
-│       │       └── summary_parser.py   # Parse AI output → SessionSummary
-│       │
-│       ├── config/                     # Configuration management
-│       │   ├── __init__.py
-│       │   ├── loader.py               # TOML loading + defaults + validation
-│       │   ├── defaults.py             # Default config values
-│       │   └── paths.py                # Path resolution (~/.claude-memory, etc.)
-│       │
-│       └── utils/                      # Shared utilities
-│           ├── __init__.py
-│           ├── text.py                 # Truncation, token estimation
-│           ├── files.py                # File path extraction from tool payloads
-│           ├── time.py                 # Timestamp formatting, relative time
-│           └── logging.py             # Structured logging setup
-│
-└── tests/
-    ├── conftest.py                     # Shared fixtures (in-memory DB, mock AI)
-    ├── cli/
-    │   ├── test_capture_cmd.py
-    │   ├── test_compress_cmd.py
-    │   ├── test_inject_cmd.py
-    │   └── test_search_cmd.py
-    ├── core/
-    │   ├── test_capture.py
-    │   ├── test_compress.py
-    │   ├── test_inject.py
-    │   ├── test_search.py
-    │   └── test_privacy.py
-    ├── db/
-    │   ├── test_schema.py
-    │   ├── test_migrations.py
-    │   └── test_repositories.py
-    └── ai/
-        ├── test_prompts.py
-        └── test_parsers.py
-```
+| Excuse you will use | Reality |
+|---|---|
+| "This is a simple question, no investigation needed" | Simple questions get wrong answers when you skip evidence. Every time. |
+| "I already know how this code works from earlier" | Memory degrades and code changes. Re-read the file. |
+| "Reading every file would take too long" | Wrong answers take longer to fix than reading takes. Always. |
+| "The user wants a quick answer" | Users want a CORRECT answer. Speed without accuracy is wasted time. |
+| "I'm fairly confident about this" | Confidence is not evidence. Read the code. |
+| "I'll verify after I give my initial answer" | Post-hoc verification is defending your guess, not finding truth. |
+| "This is obvious from the function name" | Function names lie. Implementations don't. Read the implementation. |
+| "I can infer this from the patterns I've seen" | Inference without reading is guessing. Read the code. |
+| "Checking would be redundant here" | If you haven't checked, you don't know it's redundant. Check. |
 
-### 14.3 Design Principles
+## When Corrected
 
-| Principle                   | How It's Applied                                                                                          |
-|-----------------------------|-----------------------------------------------------------------------------------------------------------|
-| Separation of concerns      | `cli/` → Click, `core/` → business rules, `db/` → SQL, `ai/` → LLM calls. No cross-boundary leaks.     |
-| Repository pattern           | Each entity gets its own repository. Adding an entity = new model + new repo.                             |
-| Swappable AI provider        | `ai/base.py` defines abstract interface. Adding a provider = implement the interface in a new file.       |
-| Prompts as data              | Templates in `ai/prompts/`, separate from orchestration. Iterate on prompts without touching logic.       |
-| Isolated queries             | Complex SQL in `db/queries/`, not scattered through business logic.                                       |
-| Testable at every layer      | Core: no CLI/DB. DB: in-memory SQLite. AI: mock providers.                                                |
+If the user says you are wrong, or your claim is inaccurate:
 
-### 14.4 Extension Points
-
-| Want to add...            | Where to add it                                              |
-|---------------------------|--------------------------------------------------------------|
-| New knowledge type         | `models/enums.py` + `ai/prompts/compression.py`             |
-| New AI provider            | Implement `ai/base.py` interface in new file                |
-| New CLI command            | New file in `cli/`, register in `cli/__init__.py`           |
-| New storage backend        | Implement repository interfaces for new backend             |
-| Web dashboard (future)     | New top-level `dashboard/` package importing `db/` + `models/` |
-
----
-
-## 15. Dependencies
-
-### Runtime
-- **click** — CLI framework
-- **tomli** — TOML parsing (stdlib `tomllib` on Python 3.11+)
-
-### Development
-- **pytest** — Testing framework
-- **pytest-cov** — Coverage reporting
-
-### Not Dependencies
-- SQLite — Python stdlib (`sqlite3`)
-- JSON — Python stdlib
-- subprocess — Python stdlib (for Claude Code CLI calls)
-- uuid — Python stdlib
-- pathlib — Python stdlib
-- datetime — Python stdlib
-
-**Minimum Python version: 3.10** (for `match` statements, modern type hints)
-
----
-
-## 16. Installation & First Run
-
-```bash
-# Install from PyPI (future) or local
-pip install claude-memory
-# or
-pip install -e .
-
-# Initialize database and config
-claude-memory init
-# Creates ~/.claude-memory/ directory
-# Creates claude-memory.db with schema
-# Creates default config.toml
-
-# Install hooks into Claude Code (workspace-level)
-cd /path/to/your/workspace
-claude-memory install
-# Writes hook config to .claude/settings.json
-
-# Verify installation
-claude-memory stats
-# Shows: 0 sessions, 0 observations, 0 knowledge entries, DB size
-
-# Start a Claude Code session — memory capture begins automatically
-claude
-```
-
----
-
-## 17. Scope Boundaries — What's NOT Included
-
-- **Web dashboard** — deferred to future version
-- **MCP server** — not needed, CLI-only integration
-- **Vector embeddings / semantic search** — FTS5 keyword search is sufficient for v1
-- **Multi-user / team sharing** — local-only, single user
-- **Branch-level scoping** — workspace = directory path, no git branch awareness
-- **Real-time streaming UI** — no daemon, no WebSocket
-- **Cloud sync / backup** — user can back up `~/.claude-memory/` manually
-- **Automatic CLAUDE.md generation** — not in scope (complementary, not overlapping)
-
+1. Do NOT defend or rationalize.
+2. Go read the actual code, file, or output.
+3. State specifically what you got wrong and what the truth is.
+4. Only then continue.
